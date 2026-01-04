@@ -23,7 +23,7 @@ langchain==0.1.16
 langchain-core>=0.1.53  # CVE-2024-10940 fix
 langchain-openai==0.0.8
 langchain-anthropic==0.1.4
-langgraph==0.0.32
+langgraph==1.0.5
 langsmith>=0.1.84  # PVE-2024-72059 fix
 google-generativeai
 
