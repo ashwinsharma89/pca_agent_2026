@@ -111,7 +111,7 @@ sentry-sdk
 groq>=0.4.0
 
 # Async Tasks (Celery)
-celery[redis]==5.3.4
+celery[redis]==5.6.2
 flower==2.0.1  # Celery monitoring
 
 # Distributed Tracing (OpenTelemetry)
