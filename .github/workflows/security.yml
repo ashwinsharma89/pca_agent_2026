@@ -52,7 +52,7 @@ jobs:
           pip-audit -r requirements.txt --format json > pip-audit-results.json || true
 
       - name: Upload security reports
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: security-audit-reports
           path: |
