@@ -23,7 +23,7 @@ import logging
 
 # Import your existing modules
 from src.query_engine.nl_to_sql import NaturalLanguageQueryEngine
-from src.database.connection import get_db_manager
+from src.database.duckdb_manager import get_duckdb_manager, CAMPAIGNS_PARQUET
 from src.api.middleware.auth import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -226,19 +226,22 @@ async def process_intelligence_query(
         
         # Try to use real engine, fallback to mock if it fails
         try:
-             # Load data from database into engine's DuckDB
-            db_manager = get_db_manager()
-            with db_manager.get_session() as session:
-                # Fetch recent campaign data to provide context and schema
-                query = text("SELECT * FROM campaigns ORDER BY date DESC LIMIT 10000")  # nosec B608
-                db_result = session.execute(query)
-                # Use a list of dictionaries to build the DataFrame
-                df = pd.DataFrame([dict(r) for r in db_result.mappings().all()])
+             # Load data from DuckDB/Parquet into engine's DuckDB
+            db_manager = get_duckdb_manager()
+            
+            if not db_manager.has_data():
+                logger.warning("No campaign data found in Parquet for intelligence query")
+                raise HTTPException(
+                    status_code=400,
+                    detail="No campaign data available. Please upload data before using Intelligence Studio."
+                )
+            
+            # Load data from Parquet
+            with db_manager.connection() as conn:
+                df = conn.execute(f"SELECT * FROM '{CAMPAIGNS_PARQUET}' LIMIT 10000").df()
             
             if df.empty:
-                logger.warning("No campaign data found in database for intelligence query")
-                # We still need to load at least an empty DF with correct columns if possible,
-                # or raise an informative error.
+                logger.warning("Campaign data exists but is empty")
                 raise HTTPException(
                     status_code=400,
                     detail="No campaign data available. Please upload data before using Intelligence Studio."

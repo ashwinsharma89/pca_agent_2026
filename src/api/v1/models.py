@@ -84,6 +84,43 @@ class CampaignFilterRequest(BaseModel):
             return [sanitize_string(item) for item in v]
         return v
 
+class VisualizationsQuery(BaseModel):
+    """
+    Strict validation for visualization query parameters.
+    Replaces loose endpoint arguments with a strongly typed dependency.
+    """
+    platforms: Optional[str] = Field(None, max_length=1000, description="Comma-separated platforms")
+    channels: Optional[str] = Field(None, max_length=1000)
+    regions: Optional[str] = Field(None, max_length=1000)
+    devices: Optional[str] = Field(None, max_length=1000)
+    placements: Optional[str] = Field(None, max_length=1000)
+    adTypes: Optional[str] = Field(None, max_length=1000)
+    funnel_stages: Optional[str] = Field(None, max_length=1000)
+    audiences: Optional[str] = Field(None, max_length=1000)
+    ages: Optional[str] = Field(None, max_length=1000)
+    objectives: Optional[str] = Field(None, max_length=1000)
+    targetings: Optional[str] = Field(None, max_length=1000)
+    
+    start_date: Optional[str] = Field(None, pattern=r'^\d{4}-\d{2}-\d{2}$', description="YYYY-MM-DD")
+    end_date: Optional[str] = Field(None, pattern=r'^\d{4}-\d{2}-\d{2}$', description="YYYY-MM-DD")
+    
+    primary_metric: Optional[str] = Field('spend', max_length=50)
+    secondary_metric: Optional[str] = Field(None, max_length=50)
+
+    @validator('*', pre=True)
+    def sanitize_inputs(cls, v):
+        if isinstance(v, str):
+            # Bleach clean and strip
+            return sanitize_string(v)
+        return v
+    
+    @validator('end_date')
+    def validate_dates(cls, v, values):
+        if v and values.get('start_date'):
+            if v < values['start_date']:
+                raise ValueError("End date must be after start date")
+        return v
+
 # ============================================================================
 # WEBHOOK VALIDATION
 # ============================================================================
@@ -123,9 +160,20 @@ class GlobalAnalysisRequest(BaseModel):
     include_recommendations: bool = Field(default=True, description="Include AI recommendations")
     include_benchmarks: bool = Field(default=True, description="Include industry benchmarks")
     analysis_depth: Optional[str] = Field(default="deep", pattern=r'^(quick|standard|deep)$', description="Analysis depth level")
+    
+    # Dynamic Context Fields
+    campaign_objective: Optional[str] = Field(None, max_length=500, description="E.g. 'Lead Generation', 'Maximize ROAS'")
+    conversion_definition: Optional[str] = Field(None, max_length=500, description="E.g. 'Form Submit', 'Purchase'")
+    time_period: Optional[str] = Field(None, max_length=100, description="E.g. 'Q4 2024', 'Last 30 Days'")
+    enrichment_context: Optional[Dict[str, Any]] = Field(default={}, description="Additional context: attribution_model, historical_baseline, etc.")
 
     @validator('analysis_depth')
     def sanitize_depth(cls, v):
+        if v: return sanitize_string(v)
+        return v
+    
+    @validator('campaign_objective', 'conversion_definition', 'time_period')
+    def sanitize_context(cls, v):
         if v: return sanitize_string(v)
         return v
 
@@ -145,3 +193,30 @@ class KPIComparisonRequest(BaseModel):
     @validator('kpis')
     def sanitize_kpis(cls, v):
         return [sanitize_string(kpi) for kpi in v]
+
+# ============================================================================
+# DATA QUALITY MODELS
+# ============================================================================
+
+class AttributionSettings(BaseModel):
+    model_type: str = Field(default="Last Click", description="Attribution model used")
+    lookback_window: Optional[str] = Field(None, description="Lookback window (e.g. 30 days)")
+
+class PCAAnalysisInput(BaseModel):
+    """
+    Structured input for analysis, including data context and quality metadata.
+    Does NOT replace the raw DataFrame, but describes it.
+    """
+    campaign_name: str = "Global Campaign Analysis"
+    platforms: List[str] = []
+    attribution: Optional[AttributionSettings] = None
+    
+    # Metadata about the dataframe columns (populated by the analyzer)
+    has_revenue: bool = False
+    has_funnel: bool = False
+    has_historical: bool = False
+    sample_size: int = 0
+    date_range: str = "Unknown"
+    
+    class Config:
+        arbitrary_types_allowed = True

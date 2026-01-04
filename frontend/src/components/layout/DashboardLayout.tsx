@@ -22,7 +22,8 @@ import {
     Zap,
     AlertTriangle,
     Brain,
-    Palette
+    Palette,
+    Globe
 } from 'lucide-react';
 
 export function DashboardLayout({ children }: { children: React.ReactNode }) {
@@ -56,13 +57,10 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
         { href: '/in-depth-analysis', label: 'Analytics Studio', icon: Activity },
         { href: '/dashboard-builder', label: 'Dashboard Builder', icon: Layout },
         { href: '/intelligence-studio', label: 'Intelligence Studio', icon: Brain },
-        { href: '/anomaly-detective', label: 'Anomaly Detective', icon: AlertTriangle },
-        { href: '/real-time-command', label: 'Real-Time Command', icon: Zap },
-        { href: '/reports', label: 'Reports & Export', icon: FileText },
-        { href: '/comparison', label: 'Comparison', icon: Scale },
         { href: '/ai-insights', label: 'AI Insights', icon: Sparkles },
         { href: '/regression', label: 'Regression', icon: TrendingUp },
         { href: '/chat', label: 'Q&A', icon: MessageSquare },
+        { href: '/ad-explorer', label: 'API Connections', icon: Globe },
         { href: '/settings', label: 'Settings', icon: Settings },
     ];
 

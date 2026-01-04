@@ -31,7 +31,8 @@ interface CustomContentProps {
     onDrillDown?: (name: string) => void;
 }
 
-const CustomContent = ({ x, y, width, height, index, name, value, onDrillDown }: CustomContentProps) => {
+const CustomContent = (props: any) => {
+    const { x, y, width, height, index, name, value, onDrillDown } = props;
     if (width < 50 || height < 30) return null;
 
     return (

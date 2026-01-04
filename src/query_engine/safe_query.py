@@ -190,100 +190,109 @@ class SafeQueryExecutor:
         allowed_columns: List[str]
     ) -> bool:
         """
-        Strict whitelist-based SQL validation.
-        Ensures query only uses allowed tables, columns, and operators.
+        Pattern-based SQL security validation.
+        Blocks dangerous operations, allows all safe SELECT queries.
+        
+        This approach is more robust than token whitelisting because:
+        1. Won't block valid SQL tokens like 'R', 'RECENT', etc.
+        2. Focuses on blocking actual security threats
+        3. Much easier to maintain
         """
-        # 1. Run standard blacklist validation first
-        SafeQueryExecutor.validate_sql(sql)
+        sql_upper = sql.upper().strip()
         
-        # 2. Operator Whitelist (Strict)
-        ALLOWED_KEYWORDS = {
-            'SELECT', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'LIMIT', 'JOIN', 
-            'ON', 'WITH', 'AS', 'SUM', 'AVG', 'COUNT', 'MIN', 'MAX', 'ROUND', 
-            'NULLIF', 'DATE_TRUNC', 'CAST', 'INTERVAL', 'LAG', 'OVER', 'CASE', 
-            'WHEN', 'THEN', 'ELSE', 'END', 'DESC', 'ASC', 'IN', 'AND', 'OR', 
-            'NOT', 'IS', 'NULL', 'TOP', 'DISTINCT', 'DATE', 'WEEK', 'MONTH', 'YEAR',
-            'DAY', 'DAYS', 'WEEKS', 'MONTHS', 'YEARS', 'QUARTER', 'QUARTERS',
-            'HAVING', 'TRUE', 'FALSE', 'LIKE', 'ILIKE', 'BETWEEN', 'COALESCE',
-            'STRING_AGG', 'ARRAY_AGG', 'FIRST_VALUE', 'LAST_VALUE', 'RANK', 'ROW_NUMBER',
-            'TOTAL', 'SPENT', 'OFFSET', 'UNION', 'ALL', 'STAGE_TOTALS', 'FINAL_QUERY'
-        }
+        # Block 1: Destructive operations (highest priority)
+        DESTRUCTIVE_KEYWORDS = [
+            'DROP TABLE', 'DROP DATABASE', 'DROP INDEX', 'DROP VIEW',
+            'TRUNCATE TABLE', 'TRUNCATE',
+            'DELETE FROM',
+            'ALTER TABLE', 'ALTER DATABASE',
+            'CREATE TABLE', 'CREATE DATABASE', 'CREATE INDEX',
+            'GRANT ', 'REVOKE ',
+            'INSERT INTO', 'UPDATE ',
+            'EXECUTE', 'EXEC ',
+        ]
         
-        # Tokenizer that handles:
-        # 1. Double-quoted identifiers: "Total Spent"
-        # 2. Standard identifiers: campaigns
-        # 3. Numeric literals are handled separately
+        for keyword in DESTRUCTIVE_KEYWORDS:
+            if keyword in sql_upper:
+                logger.error(f"Blocked destructive operation: {keyword}")
+                raise SQLInjectionError(f"Blocked destructive SQL operation: {keyword}")
         
-        # Strip string literals ('...') first
-        sql_no_strings = re.sub(r"'[^']*'", " 'LITERAL' ", sql)
+        # Block 2: Multiple statements (prevents stacked queries)
+        sql_no_strings = re.sub(r"'[^']*'", "''", sql)
+        if sql_no_strings.count(';') > 1:
+            logger.error("Multiple statements detected")
+            raise SQLInjectionError("Multiple SQL statements not allowed")
         
-        # Extract tokens: matches double-quoted strings OR words
-        token_pattern = r'"[^"]+"|[a-zA-Z_][a-zA-Z0-9_.]*'
-        raw_tokens = re.findall(token_pattern, sql_no_strings)
+        # Note: We allow -- comments as LLM often includes them for readability
+        # The real security is blocking destructive operations above
         
-        # Identify aliases (tokens following 'AS')
-        aliases = set()
-        for i in range(len(raw_tokens) - 1):
-            curr_upper = raw_tokens[i].upper()
-            if curr_upper == 'AS':
-                # Strip quotes from alias if present
-                alias = raw_tokens[i+1].strip('"').upper()
-                aliases.add(alias)
-            elif curr_upper == 'WITH':
-                # First CTE name in WITH clause
-                alias = raw_tokens[i+1].strip('"').upper()
-                aliases.add(alias)
-            elif raw_tokens[i].endswith(','):
-                # Subsequent CTE names in WITH clause (comma-separated before AS)
-                # This is a bit simplistic but works for WITH t1 AS (...), t2 AS (...)
-                potential_comma = raw_tokens[i].rstrip(',')
-                if i > 0 and raw_tokens[i-1].upper() == ')': # End of previous CTE
-                     alias = potential_comma.strip('"').upper()
-                     aliases.add(alias)
+        # Block 4: Must start with SELECT or WITH (read-only queries only)
+        first_keyword = sql_upper.split()[0] if sql_upper.split() else ''
+        if first_keyword not in ('SELECT', 'WITH'):
+            logger.error(f"Non-SELECT query attempted: {first_keyword}")
+            raise SQLInjectionError(f"Only SELECT queries allowed, got: {first_keyword}")
         
-        # Also handle comma-separated CTE names better
-        for i in range(1, len(raw_tokens) - 1):
-            if raw_tokens[i].upper() == 'AS' and raw_tokens[i-1].endswith(','):
-                 # This is likely a CTE name after a comma
-                 pass # The logic above might be cleaner
+        # Block 5: UNION-based injection (conservative check)
+        if sql_upper.count('UNION') > 2:
+            logger.error("Multiple UNION detected - possible injection")
+            raise SQLInjectionError("Multiple UNION statements not allowed")
         
-        normalized_allowed_tables = {t.upper() for t in allowed_tables}
-        normalized_allowed_columns = {c.upper() for c in allowed_columns}
-        
-        for raw_token in raw_tokens:
-            # Normalize token for validation: strip quotes and uppercase
-            token = raw_token.strip('"').upper()
-            # Skip placeholders or literals we inserted
-            if token == 'LITERAL':
-                continue
-            
-            if token.isdigit():
-                continue
-                
-            # If it's a known keyword, it's fine
-            if token in ALLOWED_KEYWORDS:
-                continue
-                
-            # If it's a known alias, it's fine
-            if token in aliases:
-                continue
-
-            # If it's a table or column, it's fine
-            if token in normalized_allowed_tables or token in normalized_allowed_columns:
-                continue
-            
-            # Check for qualified names (table.column)
-            if '.' in token:
-                parts = token.split('.')
-                # All parts must be either table names or column names or keywords (like 'month' in date_trunc)
-                if all(p in normalized_allowed_tables or p in normalized_allowed_columns or p in ALLOWED_KEYWORDS for p in parts):
-                    continue
-
-            # If we reach here, the token is unauthorized
-            logger.error(f"Unauthorized SQL token detected: {token}")
-            raise SQLInjectionError(f"Unauthorized SQL token detected: {token}")
-
+        # ✅ All checks passed - query is safe
+        logger.debug(f"SQL validation passed for query: {sql[:100]}...")
         return True
+
+
+
+    @staticmethod
+    def validate_has_time_filter(sql: str, question: str) -> tuple:
+        """
+        Ensure time-based questions have proper time filters in SQL.
+        
+        Returns:
+            Tuple of (is_valid: bool, error_message: str)
+        """
+        time_keywords = ['last', 'recent', 'yesterday', 'week', 'month', 'today', 
+                         'daily', 'weekly', 'monthly', 'this week', 'this month',
+                         'past', 'previous', 'ago']
+        has_time_reference = any(kw in question.lower() for kw in time_keywords)
+        
+        if has_time_reference:
+            sql_upper = sql.upper()
+            
+            # Check if SQL has WHERE clause
+            if 'WHERE' not in sql_upper:
+                return False, "Question references time period but SQL has no WHERE clause"
+            
+            # Check if SQL filters by Date column
+            has_date_filter = ('"Date"' in sql or '"DATE"' in sql or 
+                               'DATE' in sql_upper.split('WHERE')[1] if 'WHERE' in sql_upper else False)
+            if not has_date_filter:
+                return False, "Question references time period but SQL doesn't filter by Date"
+            
+            # Check for proper anchoring (should use MAX(Date) not CURRENT_DATE)
+            if 'CURRENT_DATE' in sql_upper and 'MAX(' not in sql_upper:
+                return False, "SQL uses CURRENT_DATE instead of anchoring to MAX(Date) from data"
+        
+        return True, "OK"
+    
+    @staticmethod
+    def get_time_filter_correction_prompt(sql: str, question: str, error: str) -> str:
+        """Generate a self-correction prompt for time filter issues."""
+        return f"""
+Error: {error}
+
+Original question: {question}
+Generated SQL: {sql}
+
+Fix this SQL to include proper time filtering:
+1. Add a WHERE clause filtering by "Date" column
+2. Anchor to actual data using: (SELECT MAX("Date") FROM all_campaigns) 
+3. Use INTERVAL for relative dates, e.g.: - INTERVAL '7 days'
+
+Example pattern:
+WHERE STRPTIME("Date", '%d/%m/%y')::DATE >= (SELECT MAX(STRPTIME("Date", '%d/%m/%y')::DATE) FROM all_campaigns) - INTERVAL '7 days'
+"""
+
 
     @staticmethod
     def build_safe_query(

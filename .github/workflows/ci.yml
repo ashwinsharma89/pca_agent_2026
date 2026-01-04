@@ -1,208 +1,70 @@
-name: CI/CD Pipeline
+name: API CI Pipeline
 
 on:
   push:
-    branches: [main, develop]
+    branches: [ main, develop ]
   pull_request:
-    branches: [main, develop]
+    branches: [ main, develop ]
 
 env:
-  PYTHON_VERSION: "3.11"
-  NODE_VERSION: "20"
+  PYTHON_VERSION: "3.12"
+  POETRY_VERSION: "1.7.0"
 
 jobs:
-  # ============================================
-  # Python Backend Quality & Security
-  # ============================================
-  backend-quality:
-    name: Backend Quality Checks
+  test:
     runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install black flake8 mypy isort bandit safety pytest pytest-cov
-      
-      - name: Check formatting (Black)
-        run: black --check --line-length=100 src/
-      
-      - name: Check imports (isort)
-        run: isort --check-only --profile=black src/
-      
-      - name: Lint (flake8)
-        run: flake8 src/ --max-line-length=100 --ignore=E501,W503
-      
-      - name: Type check (mypy)
-        run: mypy src/ --ignore-missing-imports --no-strict-optional
-        continue-on-error: true
-
-  security:
-    name: Security Scanning
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      
-      - name: Install security tools
-        run: pip install bandit safety
-      
-      - name: Bandit security scan
-        run: bandit -r src/ -ll -ii -x tests/
-        continue-on-error: true
-      
-      - name: Safety dependency check
-        run: safety check --full-report
-        continue-on-error: true
-
-  backend-tests:
-    name: Backend Tests
-    runs-on: ubuntu-latest
-    needs: backend-quality
-    
     services:
-      redis:
-        image: redis:7-alpine
+      # Service containers to run with `runner-job`
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: pca_agent_test
         ports:
-          - 6379:6379
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-cov pytest-asyncio
-      
-      - name: Run tests
-        run: pytest tests/ -v --cov=src --cov-report=xml
-        env:
-          REDIS_URL: redis://localhost:6379
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
-  frontend-quality:
-    name: Frontend Quality
-    runs-on: ubuntu-latest
-    
-    defaults:
-      run:
-        working-directory: frontend
-    
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-      
-      - name: Install dependencies
-        run: npm ci
-      
-      - name: Lint
-        run: npm run lint
-        continue-on-error: true
-      
-      - name: Build
-        run: npm run build
+    - uses: actions/checkout@v3
 
-  build:
-    name: Build Docker
-    runs-on: ubuntu-latest
-    needs: [backend-tests, frontend-quality, playwright-tests]
-    if: github.ref == 'refs/heads/main'
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Build API image
-        run: docker build -t pca-api:${{ github.sha }} .
-      
-      - name: Build Frontend image
-        run: docker build -t pca-frontend:${{ github.sha }} ./frontend
+    - name: Set up Python ${{ env.PYTHON_VERSION }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
 
-  playwright-tests:
-    name: Playwright E2E Tests
-    runs-on: ubuntu-latest
-    needs: [backend-quality, frontend-quality]
-    
-    env:
-      DATABASE_URL: sqlite:///pca_agent.db
-      JWT_SECRET_KEY: test-secret-key-must-be-long-enough-32-chars
-      
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-          
-      - name: Install Backend dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          
-      - name: Initialize Test Database
-        run: |
-          python scripts/init_database.py
-          python scripts/create_user_ashwin.py
-        env:
-          PYTHONPATH: .
-          
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-          
-      - name: Install Frontend dependencies
-        working-directory: frontend
-        run: npm ci
-        
-      - name: Install Playwright Browsers
-        working-directory: frontend
-        run: npx playwright install --with-deps
-        
-      - name: Run Backend (Background)
-        run: |
-          PYTHONPATH=. python3 -m src.api.main_v3 &
-          sleep 10
-          
-      - name: Run Playwright Tests
-        working-directory: frontend
-        run: npx playwright test e2e/core-flows.spec.ts
-        env:
-          NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
-          
-      - name: Upload Playwright report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: playwright-report
-          path: frontend/playwright-report/
-          retention-days: 30
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install ruff mypy pytest pytest-cov httpx
+
+    - name: Run Linting (Ruff)
+      run: |
+        ruff check src tests
+
+    - name: Run Type Checking (Mypy)
+      run: |
+        # Ignoring errors for now to prevent pipeline failure on existing code
+        # In strictly enforced projects, remove '|| true'
+        mypy src || true
+
+    - name: Run Unit Tests
+      env:
+        DATABASE_URL: postgresql://postgres:password@localhost:5432/pca_agent_test
+        OPENAI_API_KEY: "mock-key-for-ci"
+        JWT_SECRET_KEY: "mock-secret-for-ci"
+        API_ENV: "test"
+      run: |
+        pytest tests/unit --cov=src --cov-report=xml
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false

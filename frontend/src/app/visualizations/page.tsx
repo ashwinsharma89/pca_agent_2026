@@ -120,7 +120,7 @@ export default function GlobalVisualizationsPage() {
                 filterParams.placements = filters.placements.join(',');
             }
 
-            const result = await api.getGlobalVisualizations(filterParams);
+            const result: any = await api.getGlobalVisualizations(filterParams);
             setData(result);
 
             // Extract platforms from visualization data (already aggregated by backend)
@@ -133,6 +133,7 @@ export default function GlobalVisualizationsPage() {
             if (result?.channel) {
                 const channels = result.channel.map((c: any) => c.name).filter((v: string) => v && v !== 'Unknown');
                 setAvailableChannels(channels);
+
             }
 
             // Fetch filter options from dedicated endpoint (avoids NaN serialization issues)

@@ -12,7 +12,7 @@ Provides comprehensive DI coverage for:
 
 import os
 from dependency_injector import containers, providers
-from src.database.connection import DatabaseManager, DatabaseConfig
+from src.database.connection import DatabaseManager, DatabaseConfig, get_db_session
 from src.database.repositories import (
     CampaignRepository,
     AnalysisRepository,
@@ -44,7 +44,7 @@ class DatabaseContainer(containers.DeclarativeContainer):
     
     # Session factory
     session_factory = providers.Factory(
-        db_manager.provided.get_session_direct
+        get_db_session
     )
 
 
@@ -103,7 +103,7 @@ class KnowledgeBaseContainer(containers.DeclarativeContainer):
     )
     
     # Benchmark Engine
-    from src.knowledge.benchmarks import BenchmarkEngine
+    from src.knowledge.benchmark_engine import DynamicBenchmarkEngine as BenchmarkEngine
     
     benchmark_engine = providers.Singleton(
         BenchmarkEngine,
@@ -160,9 +160,9 @@ class AgentContainer(containers.DeclarativeContainer):
     )
     
     # Channel Specialists
-    from src.agents.channel_specialists.social_specialist import SocialMediaSpecialist
-    from src.agents.channel_specialists.search_specialist import SearchSpecialist
-    from src.agents.channel_specialists.programmatic_specialist import ProgrammaticSpecialist
+    from src.agents.channel_specialists.social_agent import SocialChannelAgent as SocialMediaSpecialist
+    from src.agents.channel_specialists.search_agent import SearchChannelAgent as SearchSpecialist
+    from src.agents.channel_specialists.programmatic_agent import ProgrammaticAgent as ProgrammaticSpecialist
     
     social_specialist = providers.Factory(
         SocialMediaSpecialist,
@@ -239,6 +239,7 @@ class ServiceContainer(containers.DeclarativeContainer):
     """Container for service-level dependencies."""
     
     config = providers.Configuration()
+    db = providers.DependenciesContainer()
     repositories = providers.DependenciesContainer()
     agents = providers.DependenciesContainer()
     
@@ -247,10 +248,7 @@ class ServiceContainer(containers.DeclarativeContainer):
     
     analytics_expert = providers.Factory(
         MediaAnalyticsExpert,
-        use_anthropic=config.use_anthropic,
-        anthropic_api_key=config.anthropic_api_key,
-        openai_api_key=config.openai_api_key,
-        gemini_api_key=config.gemini_api_key
+        use_anthropic=config.use_anthropic
     )
     
     # User Service
@@ -258,14 +256,18 @@ class ServiceContainer(containers.DeclarativeContainer):
     
     user_service = providers.Factory(
         UserService,
-        session=repositories.db.session_factory
+        session=db.session_factory
     )
     
-    # Campaign Service (if exists)
-    # campaign_service = providers.Factory(
-    #     CampaignService,
-    #     repository=repositories.campaign_repository
-    # )
+    # Campaign Service
+    from src.services.campaign_service import CampaignService
+    
+    campaign_service = providers.Factory(
+        CampaignService,
+        campaign_repo=repositories.campaign_repository,
+        analysis_repo=repositories.analysis_repository,
+        context_repo=repositories.campaign_context_repository
+    )
 
 
 # ============================================================================
@@ -291,18 +293,15 @@ class EventBusContainer(containers.DeclarativeContainer):
     )
     
     analytics_listener = providers.Singleton(
-        AnalyticsEventListener,
-        event_bus=event_bus
+        AnalyticsEventListener
     )
     
     monitoring_listener = providers.Singleton(
-        MonitoringEventListener,
-        event_bus=event_bus
+        MonitoringEventListener
     )
     
     audit_listener = providers.Singleton(
-        AuditEventListener,
-        event_bus=event_bus
+        AuditEventListener
     )
 
 
@@ -372,6 +371,7 @@ class ApplicationContainer(containers.DeclarativeContainer):
     services = providers.Container(
         ServiceContainer,
         config=config,
+        db=database,
         repositories=repositories,
         agents=agents
     )

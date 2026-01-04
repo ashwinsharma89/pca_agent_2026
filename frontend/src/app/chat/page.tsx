@@ -221,18 +221,25 @@ export default function GlobalChatPage() {
     }, []);
 
 
+    // Auto-scroll disabled to keep focus on top of results/input
+    /*
     useEffect(() => {
         if (scrollRef.current) {
             scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
         }
     }, [messages]);
+    */
 
     const handleSend = async () => {
         if (!input.trim() || loading) return;
 
         const userMessage = input;
         setInput("");
-        setMessages(prev => [...prev, { role: "user", content: userMessage }]);
+        setMessages(prev => {
+            // Remove the default welcome message if it's the first interaction
+            const filtered = prev.filter(m => m.content !== "Hello! I can analyze your campaign data or answer marketing questions.\n\n**Data Mode** (default): Ask SQL-style questions about your data like 'Which platform has highest ROI?'\n\n**Knowledge Mode**: Get marketing insights, benchmarks, and best practices by enabling the toggle above.");
+            return [...filtered, { role: "user", content: userMessage }];
+        });
         setLoading(true);
         setLoadingStage("Analyzing question...");
 
@@ -241,7 +248,7 @@ export default function GlobalChatPage() {
             setTimeout(() => setLoadingStage("Executing query..."), 1500);
             setTimeout(() => setLoadingStage("Generating insights..."), 2500);
 
-            const result = await api.chatGlobal(userMessage, {
+            const result: any = await api.chatGlobal(userMessage, {
                 knowledge_mode: knowledgeMode,
                 use_rag_context: true
             });
@@ -268,6 +275,7 @@ export default function GlobalChatPage() {
                     content: `Error: ${result.error || "Failed to process query."}`
                 }]);
             }
+
         } catch (error) {
             setMessages(prev => [...prev, { role: "assistant", content: "Sorry, I encountered a network error." }]);
         } finally {
@@ -522,33 +530,10 @@ export default function GlobalChatPage() {
 
                 {/* Messages - Below Input, Newest at Top */}
                 <CardContent className="flex-1 overflow-y-auto p-4 space-y-4" ref={scrollRef}>
-                    {loading && (
-                        <div className="flex justify-start">
-                            <div className="flex gap-3">
-                                <div className={`h-8 w-8 rounded-full flex items-center justify-center ${knowledgeMode ? "bg-purple-500/20" : "bg-muted"}`}>
-                                    {knowledgeMode ? <Brain size={16} className="text-purple-400" /> : <Bot size={16} />}
-                                </div>
-                                <div className={`rounded-lg p-3 ${knowledgeMode ? "bg-purple-500/10" : "bg-muted"}`}>
-                                    <div className="flex items-center gap-2 mb-2">
-                                        <Loader2 className="h-4 w-4 animate-spin" />
-                                        <span className="text-sm font-medium">{loadingStage}</span>
-                                    </div>
-                                    <div className="flex gap-1">
-                                        <div className={`h-1 w-12 rounded-full ${loadingStage.includes("Analyzing") ? "bg-purple-500" : "bg-purple-500/30"}`} />
-                                        <div className={`h-1 w-12 rounded-full ${loadingStage.includes("Generating SQL") ? "bg-purple-500" : "bg-purple-500/30"}`} />
-                                        <div className={`h-1 w-12 rounded-full ${loadingStage.includes("Executing") ? "bg-purple-500" : "bg-purple-500/30"}`} />
-                                        <div className={`h-1 w-12 rounded-full ${loadingStage.includes("insights") ? "bg-purple-500" : "bg-purple-500/30"}`} />
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    )}
 
-                    {[...messages].reverse().map((msg, index) => (
-                        <div
-                            key={index}
-                            className={`flex w-full ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-                        >
+
+                    {messages.map((msg, index) => (
+                        <div key={index} className={`flex w-full ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
                             <div className={`flex max-w-[95%] gap-3 ${msg.role === "user" ? "flex-row-reverse" : "flex-row"}`}>
                                 <div className={`h-8 w-8 rounded-full flex items-center justify-center shrink-0 ${msg.role === "user" ? "bg-primary text-primary-foreground" : msg.knowledge_mode ? "bg-purple-500/20 text-purple-400" : "bg-muted"}`}>
                                     {msg.role === "user" ? <User size={16} /> : msg.knowledge_mode ? <Brain size={16} /> : <Bot size={16} />}
@@ -574,26 +559,40 @@ export default function GlobalChatPage() {
                                         </div>
                                     )}
 
-                                    <div className={`rounded-lg p-3 text-sm ${msg.role === "user"
-                                        ? "bg-primary text-primary-foreground"
-                                        : msg.knowledge_mode ? "bg-purple-500/10 text-foreground border border-purple-500/20" : "bg-muted text-foreground"
-                                        }`}>
-                                        {renderContent(msg.content)}
-                                    </div>
-
-                                    {/* Knowledge Sources */}
-                                    {msg.sources && msg.sources.length > 0 && (
-                                        <div className="text-xs text-muted-foreground flex items-center gap-2 flex-wrap">
-                                            <BookOpen size={10} />
-                                            <span>Sources:</span>
-                                            {msg.sources.map((source, i) => (
-                                                <span key={i} className="px-1.5 py-0.5 rounded bg-muted">{source}</span>
-                                            ))}
-                                        </div>
+                                    {/* 1. TECHNICAL: SQL Query (Assistant Only - Top Priority) */}
+                                    {msg.role === "assistant" && msg.sql && msg.sql !== "N/A (Knowledge Mode)" && (
+                                        <details className="text-xs group mt-2 mb-2">
+                                            <summary className="flex items-center gap-1.5 cursor-pointer text-muted-foreground hover:text-foreground transition-colors">
+                                                <ChevronRight size={12} className="group-open:hidden" />
+                                                <ChevronDown size={12} className="hidden group-open:inline" />
+                                                <Database size={10} />
+                                                <span>View SQL Query</span>
+                                            </summary>
+                                            <div className="mt-2 bg-slate-950 text-slate-50 p-2 rounded-md font-mono border border-slate-800">
+                                                <code className="text-slate-200 whitespace-pre-wrap break-all">{msg.sql}</code>
+                                            </div>
+                                        </details>
                                     )}
 
-                                    {/* 1. Table Results Display (First) */}
-                                    {msg.data && msg.data.length > 0 && msg.columns && (
+                                    {/* 2. ANALYSIS: Summary/Analysis Display (Assistant Only) */}
+                                    {msg.role === "assistant" && msg.summary && (
+                                        <Card className="mt-2 bg-gradient-to-r from-blue-500/10 to-purple-500/10 border-blue-500/20">
+                                            <CardHeader className="pb-2">
+                                                <div className="flex items-center gap-2">
+                                                    <Sparkles size={14} className="text-blue-500" />
+                                                    <CardTitle className="text-sm">Analysis</CardTitle>
+                                                </div>
+                                            </CardHeader>
+                                            <CardContent className="p-3 pt-0">
+                                                <div className="text-sm">
+                                                    {renderContent(msg.summary)}
+                                                </div>
+                                            </CardContent>
+                                        </Card>
+                                    )}
+
+                                    {/* 3. VISUALS: Table Results Display (Assistant Only) */}
+                                    {msg.role === "assistant" && msg.data && msg.data.length > 0 && msg.columns && (
                                         <Card className="mt-2">
                                             <CardHeader className="pb-3">
                                                 <div className="flex items-center justify-between">
@@ -657,23 +656,8 @@ export default function GlobalChatPage() {
                                         </Card>
                                     )}
 
-                                    {/* 2. SQL Query Display - Collapsible */}
-                                    {msg.sql && msg.sql !== "N/A (Knowledge Mode)" && (
-                                        <details className="text-xs group mt-2">
-                                            <summary className="flex items-center gap-1.5 cursor-pointer text-muted-foreground hover:text-foreground transition-colors">
-                                                <ChevronRight size={12} className="group-open:hidden" />
-                                                <ChevronDown size={12} className="hidden group-open:inline" />
-                                                <Database size={10} />
-                                                <span>View SQL Query</span>
-                                            </summary>
-                                            <div className="mt-2 bg-slate-950 text-slate-50 p-2 rounded-md font-mono border border-slate-800">
-                                                <code className="text-slate-200 whitespace-pre-wrap break-all">{msg.sql}</code>
-                                            </div>
-                                        </details>
-                                    )}
-
-                                    {/* 3. Chart Display */}
-                                    {msg.chart && (
+                                    {/* 4. VISUALS: Chart Display (Assistant Only) */}
+                                    {msg.role === "assistant" && msg.chart && (
                                         <Card className="mt-2">
                                             <CardHeader className="pb-2">
                                                 <div className="flex items-center gap-2">
@@ -729,21 +713,51 @@ export default function GlobalChatPage() {
                                         </Card>
                                     )}
 
-                                    {/* 3. Summary Display (Last) */}
-                                    {msg.summary && (
-                                        <Card className="mt-2 bg-gradient-to-r from-blue-500/10 to-purple-500/10 border-blue-500/20">
-                                            <CardContent className="p-3">
-                                                <div className="text-sm">
-                                                    {renderContent(msg.summary)}
-                                                </div>
-                                            </CardContent>
-                                        </Card>
+                                    {/* 5. TEXT CONTENT: User Query OR Assistant Insights (Last) */}
+                                    <div className={`rounded-lg p-3 text-sm ${msg.role === "user"
+                                        ? "bg-primary text-primary-foreground"
+                                        : msg.knowledge_mode ? "bg-purple-500/10 text-foreground border border-purple-500/20" : "bg-muted text-foreground"
+                                        }`}>
+                                        {renderContent(msg.content)}
+                                    </div>
+
+                                    {/* Knowledge Sources */}
+                                    {msg.sources && msg.sources.length > 0 && (
+                                        <div className="text-xs text-muted-foreground flex items-center gap-2 flex-wrap mt-2">
+                                            <BookOpen size={10} />
+                                            <span>Sources:</span>
+                                            {msg.sources.map((source, i) => (
+                                                <span key={i} className="px-1.5 py-0.5 rounded bg-muted">{source}</span>
+                                            ))}
+                                        </div>
                                     )}
 
                                 </div>
                             </div>
                         </div>
                     ))}
+
+                    {loading && (
+                        <div className="flex justify-start">
+                            <div className="flex gap-3">
+                                <div className={`h-8 w-8 rounded-full flex items-center justify-center ${knowledgeMode ? "bg-purple-500/20" : "bg-muted"}`}>
+                                    {knowledgeMode ? <Brain size={16} className="text-purple-400" /> : <Bot size={16} />}
+                                </div>
+                                <div className={`rounded-lg p-3 ${knowledgeMode ? "bg-purple-500/10" : "bg-muted"}`}>
+                                    <div className="flex items-center gap-2 mb-2">
+                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                        <span className="text-sm font-medium">{loadingStage}</span>
+                                    </div>
+                                    <div className="flex gap-1">
+                                        <div className={`h-1 w-12 rounded-full ${loadingStage.includes("Analyzing") ? "bg-purple-500" : "bg-purple-500/30"}`} />
+                                        <div className={`h-1 w-12 rounded-full ${loadingStage.includes("Generating SQL") ? "bg-purple-500" : "bg-purple-500/30"}`} />
+                                        <div className={`h-1 w-12 rounded-full ${loadingStage.includes("Executing") ? "bg-purple-500" : "bg-purple-500/30"}`} />
+                                        <div className={`h-1 w-12 rounded-full ${loadingStage.includes("insights") ? "bg-purple-500" : "bg-purple-500/30"}`} />
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
                 </CardContent>
             </Card>
         </div>

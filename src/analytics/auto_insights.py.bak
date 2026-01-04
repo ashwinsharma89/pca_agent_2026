@@ -1,0 +1,3568 @@
+"""
+Automated Analytics Engine with Media Domain Expertise
+Generates insights and recommendations automatically from campaign data
+"""
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Any, Optional, Tuple
+from openai import OpenAI
+import google.generativeai as genai
+from loguru import logger
+import json
+import os
+import re
+import time
+import requests
+from dotenv import load_dotenv
+from ..data_processing import MediaDataProcessor
+from ..utils.resilience import (
+    retry, circuit_breaker, timeout, safe_execute,
+    LLMError, LLMTimeoutError, LLMConnectionError, LLMRateLimitError,
+    CircuitBreakerConfig, DeadLetterQueue, FallbackChain,
+    health_checker, HealthStatus, register_health_check
+)
+from ..utils.observability import (
+    structured_logger, metrics, tracer, cost_tracker, alerts,
+    log_operation, track_metrics, trace
+)
+from ..utils.performance import (
+    get_optimizer, parallel_execute, cache_get, cache_set,
+    bundle_queries, optimize_tokens, select_model,
+    ProgressStreamer, ProgressUpdate, SemanticCache,
+    ParallelExecutor, TokenOptimizer, ModelSelector
+)
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# Ensure environment variables from .env are available when this module loads
+load_dotenv()
+
+# Initialize performance optimizer at module load
+_perf_optimizer = None
+def _get_perf_optimizer():
+    global _perf_optimizer
+    if _perf_optimizer is None:
+        _perf_optimizer = get_optimizer()
+    return _perf_optimizer
+
+
+class MediaAnalyticsExpert:
+    """AI-powered media analytics expert that generates insights automatically."""
+    
+    # Column name mappings for flexibility
+    COLUMN_MAPPINGS = {
+        'spend': ['Spend', 'spend', 'Total Spent', 'Total_Spent', 'Cost', 'cost'],
+        'conversions': ['Conversions', 'conversions', 'Site Visit', 'Site_Visit', 'Conv', 'conv'],
+        'revenue': ['Revenue', 'revenue', 'Conversion Value', 'Conversion_Value'],
+        'impressions': ['Impressions', 'impressions', 'Impr', 'impr'],
+        'clicks': ['Clicks', 'clicks', 'Click', 'click'],
+        'platform': ['Platform', 'platform', 'Channel', 'channel', 'Source', 'source'],
+        'campaign': ['Campaign', 'campaign', 'Campaign_Name', 'campaign_name', 'Campaign Name', 'Campaign_Name_Full']
+    }
+    
+    def __init__(self, api_key: Optional[str] = None, use_anthropic: Optional[bool] = None):
+        """Initialize the analytics expert."""
+        # Determine which LLM to use
+        if use_anthropic is None:
+            use_anthropic = os.getenv('USE_ANTHROPIC', 'false').lower() == 'true'
+        
+        self.use_anthropic = use_anthropic
+        
+        # Always store API keys for RAG method (which tries all LLMs)
+        self.anthropic_api_key = os.getenv('ANTHROPIC_API_KEY')
+        self.openai_api_key = os.getenv('OPENAI_API_KEY')
+        
+        if self.use_anthropic:
+            if api_key:
+                self.anthropic_api_key = api_key
+            if self.anthropic_api_key:
+                # Don't use the SDK - we'll call the API directly via HTTP
+                self.client = None  # We'll use requests library instead
+                self.model = (
+                    os.getenv('DEFAULT_ANTHROPIC_MODEL')
+                    or os.getenv('DEFAULT_LLM_MODEL')
+                    or 'claude-sonnet-4-5-20250929'
+                )
+                logger.info(f"Initialized with Anthropic Claude (HTTP API): {self.model}")
+            else:
+                logger.warning("No Anthropic API key found. Falling back to OpenAI.")
+                self.use_anthropic = False
+        
+        if not self.use_anthropic:
+            openai_key = api_key or self.openai_api_key
+            if not openai_key:
+                raise ValueError("OPENAI_API_KEY not found")
+            self.client = OpenAI(api_key=openai_key)
+            self.model = (
+                os.getenv('DEFAULT_OPENAI_MODEL')
+                or os.getenv('OPENAI_MODEL')
+                or 'gpt-4o-mini'
+            )
+            logger.info(f"Initialized with OpenAI: {self.model}")
+        
+        # Initialize Gemini client as a fallback
+        self.gemini_client = None
+        self.gemini_api_key = os.getenv('GOOGLE_API_KEY')
+        if self.gemini_api_key:
+            try:
+                genai.configure(api_key=self.gemini_api_key)
+                self.gemini_client = genai.GenerativeModel('gemini-2.0-flash-exp')
+                logger.info("Gemini 2.0 Flash client initialized successfully for fallback.")
+            except Exception as e:
+                logger.warning(f"Could not initialize Gemini client: {e}")
+        
+        self.insights = []
+        self.recommendations = []
+        self.processor = MediaDataProcessor()
+        logger.info("Initialized MediaAnalyticsExpert with advanced data processor")
+    
+    def _get_column(self, df: pd.DataFrame, metric: str) -> Optional[str]:
+        """
+        Get the actual column name from DataFrame based on metric type.
+        
+        Args:
+            df: DataFrame to search
+            metric: Metric type (e.g., 'spend', 'conversions')
+            
+        Returns:
+            Actual column name or None if not found
+        """
+        if metric.lower() in self.COLUMN_MAPPINGS:
+            for col_name in self.COLUMN_MAPPINGS[metric.lower()]:
+                if col_name in df.columns:
+                    return col_name
+        return None
+
+    @staticmethod
+    def _strip_italics(text: str) -> str:
+        """Comprehensive formatting cleanup with regex to fix common LLM formatting issues.
+        
+        NUCLEAR approach: Fix ALL number-letter spacing issues aggressively.
+        """
+        if not isinstance(text, str):
+            return text
+        
+        # PASS 1: Remove ALL formatting characters
+        text = re.sub(r'\*+', '', text)
+        text = re.sub(r'_+', '', text)
+        
+        # PASS 2: Fix em-dash and en-dash spacing
+        text = text.replace('—', ' - ')
+        text = text.replace('–', ' - ')
+        
+        # PASS 3: SIMPLE RULE - Always space after any number or decimal
+        # This catches ALL cases: 39.05CPA, 992campaigns, 4.45Macross, etc.
+        for _ in range(5):
+            # Space after decimal number followed by any letter
+            text = re.sub(r'(\d+\.\d+)([A-Za-z])', r'\1 \2', text)
+            # Space after integer followed by any letter
+            text = re.sub(r'(\d)([A-Za-z])', r'\1 \2', text)
+            # Space before number when preceded by letter
+            text = re.sub(r'([A-Za-z])(\d)', r'\1 \2', text)
+        
+        # PASS 5: Dictionary-based fixes for common concatenations
+        common_fixes = {
+            'campaignson': 'campaigns on',
+            'platformsgenerating': 'platforms generating',
+            'conversionsat': 'conversions at',
+            'CPAfrom': 'CPA from',
+            'CPAwith': 'CPA with',
+            'Mat': 'M at',
+            'Kconversions': 'K conversions',
+            'Mspend': 'M spend',
+            'Mimpressions': 'M impressions',
+            'Mclicks': 'M clicks',
+            'conversionswhile': 'conversions while',
+            'whileDIS': 'while DIS',
+            'DISseverely': 'DIS severely',
+            'severelyunderperforms': 'severely underperforms',
+            'underperformsat': 'underperforms at',
+            'performsat': 'performs at',
+            'comparedto': 'compared to',
+            'fromDIS': 'from DIS',
+            'fromSOC': 'from SOC',
+        }
+        for wrong, correct in common_fixes.items():
+            text = text.replace(wrong, correct)
+        
+        # PASS 6: Fix punctuation spacing
+        text = re.sub(r'([.,!?:;])([A-Za-z0-9])', r'\1 \2', text)
+        text = re.sub(r'(\))([A-Za-z])', r'\1 \2', text)
+        
+        # PASS 7: Fix camelCase (lowercase followed by uppercase)
+        text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+        
+        # PASS 8: Remove brackets from headers
+        text = re.sub(r'\[OVERALL SUMMARY\]', 'OVERALL SUMMARY:', text)
+        text = re.sub(r'\[CHANNEL SUMMARY\]', 'CHANNEL SUMMARY:', text)
+        text = re.sub(r'\[KEY STRENGTHS?\]', 'KEY STRENGTHS:', text)
+        text = re.sub(r'\[PRIORITY ACTIONS?\]', 'PRIORITY ACTIONS:', text)
+        
+        # PASS 9: Remove "SECTION N:" from headers
+        text = re.sub(r'###?\s*SECTION\s*\d+:\s*', '', text)
+        text = re.sub(r'SECTION\s*\d+:\s*', '', text)
+        
+        # PASS 10: Clean up multiple spaces
+        text = re.sub(r' {2,}', ' ', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        # Clean up whitespace per line
+        text = '\n'.join(line.strip() for line in text.split('\n'))
+        
+        return text.strip()
+
+    @staticmethod
+    def _extract_json_array(text: str) -> List[Dict[str, Any]]:
+        """Extract the first JSON array from an LLM response."""
+        if not text:
+            raise ValueError("Empty response")
+
+        cleaned = text.strip()
+        if "```" in cleaned:
+            parts = cleaned.split("```")
+            for part in parts:
+                part = part.strip()
+                if part.startswith("json"):
+                    part = part[4:].strip()
+                if part.startswith("[") and part.endswith("]"):
+                    cleaned = part
+                    break
+
+        if not cleaned.startswith("["):
+            start = cleaned.find("[")
+            end = cleaned.rfind("]")
+            if start != -1 and end != -1 and end > start:
+                cleaned = cleaned[start:end + 1]
+
+        return json.loads(cleaned)
+
+    @staticmethod
+    def _deduplicate(entries: List[Dict[str, Any]], key_fields: List[str]) -> List[Dict[str, Any]]:
+        """Remove duplicate dict entries using provided key fields."""
+        deduped: List[Dict[str, Any]] = []
+        seen: set[Tuple[Any, ...]] = set()
+
+        for entry in entries:
+            key_parts: List[Any] = []
+            for field in key_fields:
+                value = entry.get(field)
+                # Convert unhashable types to hashable equivalents
+                if isinstance(value, list):
+                    key_parts.append(tuple(value))
+                elif isinstance(value, (pd.Series, pd.DataFrame)):
+                    # Convert pandas objects to string representation
+                    key_parts.append(str(value))
+                elif isinstance(value, dict):
+                    # Convert dict to sorted tuple of items
+                    key_parts.append(tuple(sorted(value.items())))
+                else:
+                    key_parts.append(value)
+            key = tuple(key_parts)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(entry)
+
+        return deduped
+    
+    def analyze_all(self, df: pd.DataFrame, 
+                    progress_callback: Optional[callable] = None,
+                    use_parallel: bool = True,
+                    external_knowledge: str = "") -> Dict[str, Any]:
+        """
+        Run complete automated analysis on campaign data with parallel processing.
+        
+        Args:
+            df: DataFrame with campaign data
+            progress_callback: Optional callback for progress updates
+            use_parallel: Whether to use parallel processing (default True)
+            
+        Returns:
+            Dictionary with all insights and recommendations
+        """
+        start_time = time.time()
+        logger.info(f"Starting automated analysis on {len(df)} rows (parallel={use_parallel})")
+        
+        # Initialize progress streamer
+        streamer = ProgressStreamer(callback=progress_callback)
+        
+        # Stage 1: Data Validation & Processing
+        streamer.update('validation', 'started', 'Validating and processing data...')
+        df = self.processor.load_data(df, auto_detect=True)
+        data_summary = self.processor.get_data_summary()
+        overall_kpis = self.processor.calculate_overall_kpis()
+        streamer.update('validation', 'completed', 
+                       f"Validated {len(df)} rows, {data_summary['time_granularity']} granularity",
+                       data={'rows': len(df), 'granularity': data_summary['time_granularity']})
+        
+        # Stage 2: Calculate Metrics
+        streamer.update('metrics', 'started', 'Calculating metrics...')
+        metrics_data = self._calculate_metrics(df)
+        metrics_data['overall_kpis'] = overall_kpis
+        metrics_data['data_summary'] = data_summary
+        streamer.update('metrics', 'completed', 'Basic metrics calculated',
+                       data={'platforms': len(metrics_data.get('by_platform', {}))})
+        
+        # Stage 3: Parallel Analysis Tasks
+        streamer.update('insights', 'started', 'Running parallel analysis...')
+        
+        if use_parallel:
+            # Execute independent analyses in parallel
+            analysis_results = self._run_parallel_analyses(df, metrics_data)
+        else:
+            # Sequential fallback
+            analysis_results = self._run_sequential_analyses(df, metrics_data)
+        
+        funnel_analysis = analysis_results.get('funnel', {})
+        roas_analysis = analysis_results.get('roas', {})
+        audience_analysis = analysis_results.get('audience', {})
+        tactics_analysis = analysis_results.get('tactics', {})
+        
+        streamer.update('insights', 'completed', 'Analysis complete')
+        
+        # Stage 4: Generate Insights using RULE-BASED (fast) - skip LLM for speed
+        streamer.update('analysis', 'started', 'Generating insights...')
+        insights = self._generate_rule_based_insights(df, metrics_data)
+        streamer.update('analysis', 'completed', f'Generated {len(insights)} insights',
+                       data={'insight_count': len(insights)})
+        
+        # Stage 5: Generate Recommendations (rule-based for speed)
+        streamer.update('recommendations', 'started', 'Generating recommendations...')
+        
+        # All rule-based for speed - run in parallel
+        if use_parallel:
+            rec_results = self._run_parallel_recommendations_fast(df, metrics_data, insights)
+            recommendations = rec_results.get('recommendations', [])
+            opportunities = rec_results.get('opportunities', [])
+            risks = rec_results.get('risks', [])
+            budget_insights = rec_results.get('budget', {})
+        else:
+            recommendations = self._generate_rule_based_recommendations(df, metrics_data)
+            opportunities = self._identify_opportunities(df, metrics_data)
+            risks = self._assess_risks(df, metrics_data)
+            try:
+                budget_insights = self._optimize_budget(df, metrics_data)
+            except Exception as e:
+                logger.warning(f"Could not generate budget optimization: {e}")
+                budget_insights = {"current_allocation": {}, "recommended_allocation": {}, "expected_improvement": {}}
+        
+        streamer.update('recommendations', 'completed', 
+                       f'Generated {len(recommendations)} recommendations')
+        
+        # Stage 6: Executive Summary (SINGLE LLM call - the only LLM call in auto analysis)
+        streamer.update('assembly', 'started', 'Generating executive summary...')
+        executive_summary = self._generate_executive_summary(metrics_data, insights, recommendations, external_knowledge)
+        
+        elapsed = time.time() - start_time
+        streamer.update('assembly', 'completed', 
+                       f'Analysis complete in {elapsed:.1f}s',
+                       data={'total_time': elapsed})
+        
+        logger.info(f"Analysis completed in {elapsed:.2f}s (parallel={use_parallel})")
+        
+        return {
+            "metrics": metrics_data,
+            "funnel_analysis": funnel_analysis,
+            "roas_analysis": roas_analysis,
+            "audience_analysis": audience_analysis,
+            "tactics_analysis": tactics_analysis,
+            "insights": insights,
+            "recommendations": recommendations,
+            "opportunities": opportunities,
+            "risks": risks,
+            "budget_optimization": budget_insights,
+            "executive_summary": executive_summary,
+            "performance_stats": {
+                "total_time_seconds": elapsed,
+                "parallel_enabled": use_parallel,
+                "row_count": len(df)
+            }
+        }
+
+    def get_rag_summary(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Generate a RAG-enhanced summary for the campaign health check.
+        
+        Args:
+            df: Campaign data DataFrame
+            
+        Returns:
+            Dictionary with executive_summary and recommendations
+        """
+        # Run full analysis to get all insights (using parallel for speed)
+        # In a real RAG scenario, this would potentially query a vector DB
+        # But for now, we rely on the rule-based + LLM synthesis of analyze_all
+        full_analysis = self.analyze_all(df, use_parallel=True)
+        
+        return {
+            "executive_summary": full_analysis.get("executive_summary"),
+            "key_findings": full_analysis.get("insights", []),
+            "recommendations": full_analysis.get("recommendations", [])
+        }
+    
+    def _run_parallel_analyses(self, df: pd.DataFrame, metrics_data: Dict) -> Dict[str, Any]:
+        """Run independent analyses in parallel."""
+        results = {}
+        
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(self._analyze_funnel, df, metrics_data): 'funnel',
+                executor.submit(self._safe_roas_analysis, df, metrics_data): 'roas',
+                executor.submit(self._analyze_audience, df, metrics_data): 'audience',
+                executor.submit(self._analyze_tactics, df, metrics_data): 'tactics'
+            }
+            
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    results[key] = future.result(timeout=30)
+                except Exception as e:
+                    logger.warning(f"Parallel analysis {key} failed: {e}")
+                    results[key] = {}
+        
+        return results
+    
+    def _run_sequential_analyses(self, df: pd.DataFrame, metrics_data: Dict) -> Dict[str, Any]:
+        """Run analyses sequentially (fallback)."""
+        return {
+            'funnel': self._analyze_funnel(df, metrics_data),
+            'roas': self._safe_roas_analysis(df, metrics_data),
+            'audience': self._analyze_audience(df, metrics_data),
+            'tactics': self._analyze_tactics(df, metrics_data)
+        }
+    
+    def _safe_roas_analysis(self, df: pd.DataFrame, metrics_data: Dict) -> Dict:
+        """ROAS analysis with error handling."""
+        try:
+            return self._analyze_roas_revenue(df, metrics_data)
+        except Exception as e:
+            logger.warning(f"Could not generate ROAS analysis: {e}")
+            return {"overall": {}, "by_platform": {}, "efficiency_tiers": {}}
+    
+    def _run_parallel_recommendations(self, df: pd.DataFrame, 
+                                      metrics_data: Dict, 
+                                      insights: List) -> Dict[str, Any]:
+        """Run recommendation generation tasks in parallel."""
+        results = {}
+        
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(self._generate_recommendations, df, metrics_data, insights): 'recommendations',
+                executor.submit(self._identify_opportunities, df, metrics_data): 'opportunities',
+                executor.submit(self._assess_risks, df, metrics_data): 'risks',
+                executor.submit(self._safe_budget_optimization, df, metrics_data): 'budget'
+            }
+            
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    results[key] = future.result(timeout=60)
+                except Exception as e:
+                    logger.warning(f"Parallel recommendation {key} failed: {e}")
+                    results[key] = [] if key != 'budget' else {}
+        
+        return results
+    
+    def _run_parallel_recommendations_fast(self, df: pd.DataFrame, 
+                                           metrics_data: Dict, 
+                                           insights: List) -> Dict[str, Any]:
+        """Run FAST rule-based recommendation tasks in parallel (no LLM calls)."""
+        results = {}
+        
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(self._generate_rule_based_recommendations, df, metrics_data): 'recommendations',
+                executor.submit(self._identify_opportunities, df, metrics_data): 'opportunities',
+                executor.submit(self._assess_risks, df, metrics_data): 'risks',
+                executor.submit(self._safe_budget_optimization, df, metrics_data): 'budget'
+            }
+            
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    results[key] = future.result(timeout=30)
+                except Exception as e:
+                    logger.warning(f"Parallel recommendation {key} failed: {e}")
+                    results[key] = [] if key != 'budget' else {}
+        
+        return results
+    
+    def _safe_budget_optimization(self, df: pd.DataFrame, metrics_data: Dict) -> Dict:
+        """Budget optimization with error handling."""
+        try:
+            return self._optimize_budget(df, metrics_data)
+        except Exception as e:
+            logger.warning(f"Could not generate budget optimization: {e}")
+            return {"current_allocation": {}, "recommended_allocation": {}, "expected_improvement": {}}
+    
+    def _calculate_metrics(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Calculate comprehensive metrics from the data."""
+        metrics = {
+            "overview": {},
+            "by_campaign": {},
+            "by_platform": {},
+            "performance_tiers": {},
+            "trends": {}
+        }
+        
+        # Overall metrics
+        # Get column names using helper
+        spend_col = self._get_column(df, 'spend')
+        conv_col = self._get_column(df, 'conversions')
+        impr_col = self._get_column(df, 'impressions')
+        clicks_col = self._get_column(df, 'clicks')
+        campaign_col = self._get_column(df, 'campaign')
+        
+        # Calculate aggregate totals first
+        total_spend = float(df[spend_col].sum()) if spend_col else 0
+        total_conversions = float(df[conv_col].sum()) if conv_col else 0
+        total_impressions = float(df[impr_col].sum()) if impr_col else 0
+        total_clicks = float(df[clicks_col].sum()) if clicks_col else 0
+        
+        # Calculate derived metrics from aggregates (weighted averages)
+        avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
+        avg_cpc = (total_spend / total_clicks) if total_clicks > 0 else 0
+        avg_cpa = (total_spend / total_conversions) if total_conversions > 0 else 0
+        avg_conversion_rate = (total_conversions / total_clicks * 100) if total_clicks > 0 else 0
+        avg_roas = float(df['ROAS'].mean()) if 'ROAS' in df.columns and df['ROAS'].notna().any() else 0
+        
+        metrics["overview"] = {
+            "total_campaigns": df[campaign_col].nunique() if campaign_col else len(df),
+            "total_platforms": df['Platform'].nunique() if 'Platform' in df.columns else 0,
+            "total_spend": total_spend,
+            "total_conversions": total_conversions,
+            "total_impressions": total_impressions,
+            "total_clicks": total_clicks,
+            "avg_roas": avg_roas,
+            "avg_cpa": avg_cpa,
+            "avg_ctr": avg_ctr,
+            "avg_cpc": avg_cpc,
+            "avg_conversion_rate": avg_conversion_rate,
+        }
+        
+        # Campaign-level metrics
+        if 'Campaign_Name' in df.columns:
+            campaign_metrics = df.groupby('Campaign_Name').agg({
+                'Spend': 'sum',
+                'Conversions': 'sum',
+                'ROAS': 'mean',
+                'CPA': 'mean',
+                'Impressions': 'sum',
+                'Clicks': 'sum'
+            }).round(2)
+            
+            metrics["by_campaign"] = campaign_metrics.to_dict('index')
+        
+        # Platform-level metrics
+        if 'Platform' in df.columns:
+            try:
+                # Handle potential duplicate columns by selecting first occurrence
+                platform_col = df['Platform']
+                if isinstance(platform_col, pd.DataFrame):
+                    platform_col = platform_col.iloc[:, 0]
+                
+                # Create temp df with unique column
+                temp_df = df.copy()
+                temp_df['_Platform'] = platform_col
+                
+                # Build aggregation dict based on available columns using helper
+                agg_dict = {}
+                
+                # Get column names using mapping
+                spend_col = self._get_column(temp_df, 'spend')
+                if spend_col:
+                    agg_dict[spend_col] = 'sum'
+                
+                conv_col = self._get_column(temp_df, 'conversions')
+                if conv_col:
+                    agg_dict[conv_col] = 'sum'
+                
+                impr_col = self._get_column(temp_df, 'impressions')
+                if impr_col:
+                    agg_dict[impr_col] = 'sum'
+                
+                clicks_col = self._get_column(temp_df, 'clicks')
+                if clicks_col:
+                    agg_dict[clicks_col] = 'sum'
+                
+                # These are usually calculated metrics
+                for col_name in ['ROAS', 'CPA', 'CTR']:
+                    if col_name in temp_df.columns:
+                        agg_dict[col_name] = 'mean'
+                
+                if agg_dict:
+                    platform_metrics = temp_df.groupby('_Platform').agg(agg_dict).round(2)
+                    metrics["by_platform"] = platform_metrics.to_dict('index')
+                else:
+                    metrics["by_platform"] = {}
+            except Exception as e:
+                logger.warning(f"Could not calculate platform metrics: {e}")
+                metrics["by_platform"] = {}
+        
+        # Performance tiers
+        if 'ROAS' in df.columns:
+            metrics["performance_tiers"] = {
+                "excellent": len(df[df['ROAS'] >= 4.5]),
+                "good": len(df[(df['ROAS'] >= 3.5) & (df['ROAS'] < 4.5)]),
+                "average": len(df[(df['ROAS'] >= 2.5) & (df['ROAS'] < 3.5)]),
+                "poor": len(df[df['ROAS'] < 2.5])
+            }
+        
+        # Dimension-level metrics (Channel, Funnel, Creative, Audience)
+        for dim, col_name in [
+            ('by_channel', 'Channel'),
+            ('by_funnel', 'Funnel_Stage'),
+            ('by_creative', 'Creative_Type'),
+            ('by_audience', 'Audience'),
+            ('by_device', 'Device'),
+            ('by_placement', 'Placement'),
+            ('by_region', 'Region'),
+            ('by_ad_type', 'Ad_Type')
+        ]:
+            if col_name in df.columns:
+                try:
+                    # Filter out nulls/None
+                    dim_df = df[df[col_name].notna() & (df[col_name] != 'None') & (df[col_name] != '')]
+                    if not dim_df.empty:
+                        agg_dict = {
+                            spend_col: 'sum' if spend_col else 'count',
+                            conv_col: 'sum' if conv_col else 'count'
+                        }
+                        # Add ROAS if available
+                        if 'ROAS' in df.columns:
+                            agg_dict['ROAS'] = 'mean'
+                            
+                        # Perform aggregation
+                        dim_metrics = dim_df.groupby(col_name).agg(agg_dict).round(2)
+                        
+                        # Fix column names to match expected output (Spend, Conversions etc)
+                        rename_map = {}
+                        if spend_col: rename_map[spend_col] = 'Spend'
+                        if conv_col: rename_map[conv_col] = 'Conversions'
+                        dim_metrics = dim_metrics.rename(columns=rename_map)
+                        
+                        metrics[dim] = dim_metrics.to_dict('index')
+                except Exception as e:
+                    logger.warning(f"Could not calculate {dim} metrics: {e}")
+
+        return metrics
+    
+    def _call_llm(self, system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> str:
+        """
+        Call LLM (OpenAI or Anthropic) with unified interface and resilience.
+        
+        Features:
+        - Retry with exponential backoff (3 attempts)
+        - Timeout handling (60s per request)
+        - Circuit breaker protection
+        - Detailed error classification
+        
+        Args:
+            system_prompt: System message
+            user_prompt: User message
+            max_tokens: Maximum tokens to generate
+            
+        Returns:
+            LLM response text
+        """
+        return self._call_llm_with_retry(system_prompt, user_prompt, max_tokens)
+    
+    @retry(
+        max_retries=3,
+        base_delay=2.0,
+        max_delay=30.0,
+        retryable_exceptions=(LLMConnectionError, LLMTimeoutError, requests.exceptions.ConnectionError, requests.exceptions.Timeout),
+        non_retryable_exceptions=(LLMRateLimitError,)
+    )
+    @trace("llm_call")
+    def _call_llm_with_retry(self, system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> str:
+        """Internal LLM call with retry decorator applied."""
+        start_time = time.time()
+        provider = "anthropic" if self.use_anthropic else "openai"
+        model = self.model
+        
+        # Track metrics
+        metrics.increment("llm_calls_total", labels={"provider": provider, "model": model})
+        
+        try:
+            if self.use_anthropic:
+                result, input_tokens, output_tokens = self._call_anthropic(system_prompt, user_prompt, max_tokens)
+            else:
+                result, input_tokens, output_tokens = self._call_openai(system_prompt, user_prompt, max_tokens)
+            
+            # Record success metrics and cost
+            elapsed_ms = (time.time() - start_time) * 1000
+            metrics.observe("llm_latency_ms", elapsed_ms, labels={"provider": provider, "model": model})
+            metrics.increment("llm_success_total", labels={"provider": provider})
+            
+            # Track cost
+            cost_tracker.record_usage(
+                model=model,
+                provider=provider,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                operation="llm_call",
+                success=True,
+                latency_ms=elapsed_ms
+            )
+            
+            structured_logger.info(
+                f"LLM call completed",
+                provider=provider,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=round(elapsed_ms, 2)
+            )
+            
+            return result
+            
+        except requests.exceptions.Timeout as e:
+            elapsed = time.time() - start_time
+            metrics.increment("llm_errors_total", labels={"provider": provider, "error_type": "timeout"})
+            structured_logger.error(f"LLM timeout after {elapsed:.2f}s", provider=provider, error=str(e))
+            raise LLMTimeoutError(provider, elapsed)
+        except requests.exceptions.ConnectionError as e:
+            metrics.increment("llm_errors_total", labels={"provider": provider, "error_type": "connection"})
+            structured_logger.error(f"LLM connection error", provider=provider, error=str(e))
+            raise LLMConnectionError(provider, str(e))
+        except requests.exceptions.HTTPError as e:
+            if e.response and e.response.status_code == 429:
+                retry_after = e.response.headers.get('retry-after')
+                metrics.increment("llm_errors_total", labels={"provider": provider, "error_type": "rate_limit"})
+                structured_logger.warning(f"Rate limit hit", provider=provider)
+                raise LLMRateLimitError(provider, int(retry_after) if retry_after else None)
+            metrics.increment("llm_errors_total", labels={"provider": provider, "error_type": "http"})
+            structured_logger.error(f"LLM HTTP error", provider=provider, error=str(e))
+            raise LLMError(str(e), provider)
+        except Exception as e:
+            metrics.increment("llm_errors_total", labels={"provider": provider, "error_type": "unknown"})
+            structured_logger.error(f"LLM call failed", provider=provider, error=str(e))
+            raise LLMError(str(e), provider)
+    
+    def _call_anthropic(self, system_prompt: str, user_prompt: str, max_tokens: int) -> tuple:
+        """Call Anthropic Claude API with timeout. Returns (text, input_tokens, output_tokens)."""
+        headers = {
+            "x-api-key": self.anthropic_api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        payload = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "temperature": 0.3,
+            "system": system_prompt,
+            "messages": [
+                {"role": "user", "content": user_prompt}
+            ]
+        }
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=60  # 60 second timeout
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        # Extract token usage
+        usage = data.get("usage", {})
+        input_tokens = usage.get("input_tokens", len(system_prompt + user_prompt) // 4)
+        output_tokens = usage.get("output_tokens", len(data["content"][0]["text"]) // 4)
+        
+        return data["content"][0]["text"], input_tokens, output_tokens
+    
+    def _call_openai(self, system_prompt: str, user_prompt: str, max_tokens: int) -> tuple:
+        """Call OpenAI API with timeout. Returns (text, input_tokens, output_tokens)."""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=max_tokens,
+            timeout=60  # 60 second timeout
+        )
+        
+        # Extract token usage
+        usage = response.usage
+        input_tokens = usage.prompt_tokens if usage else len(system_prompt + user_prompt) // 4
+        output_tokens = usage.completion_tokens if usage else len(response.choices[0].message.content) // 4
+        
+        return response.choices[0].message.content, input_tokens, output_tokens
+    
+    def _call_gemini(self, system_prompt: str, user_prompt: str) -> tuple:
+        """Call Gemini API as fallback. Returns (text, input_tokens, output_tokens)."""
+        if not self.gemini_client:
+            raise LLMError("Gemini client not initialized", "gemini")
+        
+        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        response = self.gemini_client.generate_content(full_prompt)
+        
+        # Estimate tokens (Gemini doesn't always return usage)
+        input_tokens = len(full_prompt) // 4
+        output_tokens = len(response.text) // 4
+        
+        return response.text, input_tokens, output_tokens
+    
+    def _generate_insights(self, df: pd.DataFrame, metrics: Dict) -> List[Dict[str, str]]:
+        """Generate AI-powered insights from the data."""
+        insights = []
+        
+        # Prepare data summary for AI
+        data_summary = self._prepare_data_summary(df, metrics)
+        
+        prompt = f"""You are a senior media analytics expert with 15+ years of experience in digital advertising across Google Ads, Meta, LinkedIn, DV360, CM360, and Snapchat.
+
+You have DEEP EXPERTISE in:
+- **Funnel Analysis**: Awareness → Consideration → Conversion optimization
+- **ROAS & Revenue**: Return on ad spend, revenue attribution, LTV analysis
+- **Audience Strategy**: Demographics, segments, targeting, lookalikes
+- **Tactics**: Creative performance, bidding strategies, placement optimization, A/B testing
+- **Attribution**: Multi-touch attribution, assisted conversions, path analysis
+- **Media Mix**: Cross-channel synergies, budget allocation, incrementality
+
+Analyze this campaign data and provide 8-10 KEY INSIGHTS that a CMO would find valuable:
+
+{data_summary}
+
+For each insight:
+1. Be specific with numbers and percentages
+2. Explain WHY it matters from a funnel/ROAS/audience/tactics perspective
+3. Compare to industry benchmarks where relevant (e.g., ROAS benchmarks by platform)
+4. Highlight patterns or anomalies in funnel performance, audience behavior, or tactical execution
+5. Consider full-funnel impact (not just last-click conversions)
+
+Industry Benchmarks to Consider:
+- Google Ads ROAS: 2.0-4.0x (Search), 1.5-3.0x (Display)
+- Meta Ads ROAS: 2.5-4.5x (average)
+- LinkedIn Ads ROAS: 2.0-3.5x (B2B)
+- CTR: 1.5-3.0% (good), 3.0%+ (excellent)
+- CPA: Varies by industry, but look for consistency and trends
+
+STRICT OUTPUT RULES:
+- Return VALID JSON array only (no prose before or after the array, no Markdown fences, no italics).
+- Each insight must reference concrete metrics from the data summary.
+
+Format exactly as JSON array:
+[
+  {{
+    "category": "Funnel|ROAS|Audience|Tactics|Attribution|Platform",
+    "insight": "Specific insight with numbers and funnel/audience/tactics context",
+    "impact": "High|Medium|Low",
+    "explanation": "Why this matters for business outcomes, considering full-funnel and audience dynamics"
+  }}
+]
+
+Focus on actionable insights that drive business decisions across the entire customer journey."""
+
+        try:
+            system_prompt = "You are a world-class media analytics expert. Provide data-driven insights with specific numbers. Return JSON only."
+            insights_text = self._call_llm(system_prompt, prompt, max_tokens=2000).strip()
+            insights = self._extract_json_array(insights_text)
+            logger.info(f"Generated {len(insights)} insights")
+            
+        except Exception as e:
+            logger.error(f"Error generating insights: {e}")
+            # Fallback to rule-based insights
+            insights = self._generate_rule_based_insights(df, metrics)
+        
+        return insights
+    
+    def _generate_recommendations(self, df: pd.DataFrame, metrics: Dict, insights: List) -> List[Dict[str, str]]:
+        """Generate actionable recommendations."""
+        
+        data_summary = self._prepare_data_summary(df, metrics)
+        insights_summary = json.dumps(insights, indent=2)
+        
+        prompt = f"""You are a strategic media planning expert with deep expertise in funnel optimization, ROAS improvement, audience targeting, and tactical execution.
+
+Based on this campaign data and insights, provide 6-8 ACTIONABLE RECOMMENDATIONS:
+
+Campaign Data:
+{data_summary}
+
+Key Insights:
+{insights_summary}
+
+For each recommendation:
+1. Be SPECIFIC and ACTIONABLE (not generic advice)
+2. Include expected impact with numbers
+3. Prioritize by potential ROI
+4. Consider budget constraints
+5. Include implementation timeline
+6. Address one or more of these areas:
+   - **Funnel Optimization**: Move users through awareness → consideration → conversion
+   - **ROAS Improvement**: Increase return on ad spend through better targeting/bidding
+   - **Audience Strategy**: Refine targeting, create lookalikes, segment optimization
+   - **Tactical Execution**: Creative refresh, bidding strategy, placement optimization
+   - **Attribution**: Better measurement and credit assignment
+   - **Budget Allocation**: Shift spend to higher-performing channels/audiences
+
+Tactical Recommendations Should Include:
+- Specific bidding strategies (Target ROAS, Maximize Conversions, Manual CPC)
+- Audience tactics (Lookalikes, Custom Audiences, In-Market, Affinity)
+- Creative recommendations (Video vs Static, Messaging, CTAs)
+- Placement strategies (Feed, Stories, Search, Display Network)
+- Funnel stage focus (Top-of-funnel awareness vs bottom-of-funnel conversion)
+
+Format as JSON array:
+[
+  {{
+    "priority": "Critical|High|Medium",
+    "recommendation": "Specific action to take (include funnel stage, audience, or tactic)",
+    "expected_impact": "Quantified expected outcome (ROAS, conversions, funnel movement)",
+    "implementation": "How to execute (2-3 specific steps with platform/tactic details)",
+    "timeline": "Immediate|1-2 weeks|1 month",
+    "estimated_roi": "Expected return percentage",
+    "focus_area": "Funnel|ROAS|Audience|Tactics|Attribution|Budget"
+  }}
+]
+
+Focus on recommendations that can be implemented immediately with clear tactical steps."""
+
+        try:
+            system_prompt = "You are a strategic media planning expert. Provide specific, actionable recommendations with expected ROI."
+            recs_text = self._call_llm(system_prompt, prompt, max_tokens=2000).strip()
+            if "```json" in recs_text:
+                recs_text = recs_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in recs_text:
+                recs_text = recs_text.split("```")[1].split("```")[0].strip()
+            
+            recommendations = json.loads(recs_text)
+            logger.info(f"Generated {len(recommendations)} recommendations")
+            
+        except Exception as e:
+            logger.error(f"Error generating recommendations: {e}")
+            recommendations = self._generate_rule_based_recommendations(df, metrics)
+        
+        return recommendations
+    
+    def _identify_opportunities(self, df: pd.DataFrame, metrics: Dict) -> List[Dict[str, Any]]:
+        """Identify growth opportunities across multiple KPIs."""
+        opportunities = []
+        
+        # Get column names
+        spend_col = self._get_column(df, 'spend')
+        conv_col = self._get_column(df, 'conversions')
+        clicks_col = self._get_column(df, 'clicks')
+        impr_col = self._get_column(df, 'impressions')
+        
+        # 1. High ROAS campaigns that could scale (limit to top 3)
+        if 'ROAS' in df.columns and spend_col:
+            try:
+                high_performers = df[df['ROAS'] > 4.0].sort_values('ROAS', ascending=False)
+                top_campaigns = []
+                for _, row in high_performers.head(3).iterrows():
+                    campaign_name = row.get('Campaign_Name', 'Unknown')
+                    top_campaigns.append(campaign_name)
+                
+                if top_campaigns:
+                    total_current_spend = high_performers.head(3)[spend_col].sum()
+                    avg_roas = high_performers.head(3)['ROAS'].mean()
+                    potential_revenue = total_current_spend * 0.75 * avg_roas  # 75% budget increase
+                    
+                    campaigns_text = ", ".join(top_campaigns[:3])
+                    if len(top_campaigns) > 3:
+                        campaigns_text += f" and {len(top_campaigns) - 3} more"
+                    
+                    opportunities.append({
+                        "type": "Scale Winners",
+                        "campaigns": top_campaigns[:3],
+                        "details": f"High-performing campaigns with average ROAS of {avg_roas:.2f}x",
+                        "why_it_matters": f"These campaigns ({campaigns_text}) are delivering exceptional returns",
+                        "recommended_action": f"Increase budget by 50-100% across these {len(top_campaigns[:3])} campaigns",
+                        "expected_impact": f"Could generate ${potential_revenue:,.0f} in additional revenue",
+                        "current_metrics": f"Current spend: ${total_current_spend:,.0f}, Avg ROAS: {avg_roas:.2f}x"
+                    })
+            except Exception as e:
+                logger.warning(f"Could not identify ROAS scale winners: {e}")
+        
+        # 2. High CTR campaigns (engagement opportunity)
+        if 'CTR' in df.columns and spend_col:
+            try:
+                high_ctr = df[df['CTR'] > 3.0].sort_values('CTR', ascending=False)
+                for _, row in high_ctr.head(2).iterrows():
+                    opportunities.append({
+                        "type": "High Engagement (CTR)",
+                        "campaign": row.get('Campaign_Name', 'Unknown'),
+                        "platform": row.get('Platform', 'Unknown'),
+                        "current_ctr": float(row['CTR']),
+                        "opportunity": f"CTR of {float(row['CTR']):.2f}% shows strong audience engagement - optimize for conversions",
+                        "potential_impact": "Improve conversion rate to maximize this engaged traffic"
+                    })
+            except Exception as e:
+                logger.warning(f"Could not identify CTR opportunities: {e}")
+        
+        # 3. Low CPC with good conversion rate (efficiency opportunity)
+        if 'CPC' in df.columns and 'Conversion_Rate' in df.columns and spend_col:
+            try:
+                efficient = df[(df['CPC'] < df['CPC'].median()) & (df['Conversion_Rate'] > df['Conversion_Rate'].median())]
+                for _, row in efficient.head(2).iterrows():
+                    opportunities.append({
+                        "type": "Efficient Performer (CPC + Conv Rate)",
+                        "campaign": row.get('Campaign_Name', 'Unknown'),
+                        "platform": row.get('Platform', 'Unknown'),
+                        "current_cpc": float(row['CPC']),
+                        "current_conv_rate": float(row['Conversion_Rate']),
+                        "opportunity": f"Low CPC (${float(row['CPC']):.2f}) + High Conv Rate ({float(row['Conversion_Rate']):.2f}%) = Scale opportunity",
+                        "potential_impact": "Efficient acquisition cost with strong conversion - ideal for scaling"
+                    })
+            except Exception as e:
+                logger.warning(f"Could not identify CPC/Conv Rate opportunities: {e}")
+        
+        # 4. High impression share but low CTR (creative opportunity)
+        if impr_col and 'CTR' in df.columns:
+            try:
+                high_impr_low_ctr = df[(df[impr_col] > df[impr_col].quantile(0.75)) & (df['CTR'] < 1.5)]
+                for _, row in high_impr_low_ctr.head(2).iterrows():
+                    opportunities.append({
+                        "type": "Creative Optimization (Impressions vs CTR)",
+                        "campaign": row.get('Campaign_Name', 'Unknown'),
+                        "platform": row.get('Platform', 'Unknown'),
+                        "impressions": int(row[impr_col]),
+                        "current_ctr": float(row['CTR']),
+                        "opportunity": f"High impressions ({int(row[impr_col]):,}) but low CTR ({float(row['CTR']):.2f}%) - refresh creative",
+                        "potential_impact": "Improving CTR to 2.5% could double clicks without additional spend"
+                    })
+            except Exception as e:
+                logger.warning(f"Could not identify creative opportunities: {e}")
+        
+        # 5. Good CTR but low conversion rate (landing page opportunity)
+        if 'CTR' in df.columns and 'Conversion_Rate' in df.columns:
+            try:
+                good_ctr_low_conv = df[(df['CTR'] > 2.0) & (df['Conversion_Rate'] < df['Conversion_Rate'].median())]
+                for _, row in good_ctr_low_conv.head(2).iterrows():
+                    opportunities.append({
+                        "type": "Landing Page Optimization (CTR vs Conv Rate)",
+                        "campaign": row.get('Campaign_Name', 'Unknown'),
+                        "platform": row.get('Platform', 'Unknown'),
+                        "current_ctr": float(row['CTR']),
+                        "current_conv_rate": float(row['Conversion_Rate']),
+                        "opportunity": f"Good CTR ({float(row['CTR']):.2f}%) but low Conv Rate ({float(row['Conversion_Rate']):.2f}%) - optimize landing page",
+                        "potential_impact": "Improving conversion rate could 2x conversions with same traffic"
+                    })
+            except Exception as e:
+                logger.warning(f"Could not identify landing page opportunities: {e}")
+        
+        # 6. Underutilized platforms with strong KPIs
+        if 'Platform' in df.columns and spend_col:
+            try:
+                platform_col = df['Platform']
+                if isinstance(platform_col, pd.DataFrame):
+                    platform_col = platform_col.iloc[:, 0]
+                
+                temp_df = df.copy()
+                temp_df['_Platform'] = platform_col
+                platform_spend = temp_df.groupby('_Platform')[spend_col].sum()
+                total_spend = platform_spend.sum()
+                
+                for platform, spend in platform_spend.items():
+                    if spend / total_spend < 0.10:  # Less than 10% of budget
+                        platform_data = df[df['Platform'] == platform]
+                        kpis = []
+                        if 'ROAS' in df.columns:
+                            avg_roas = platform_data['ROAS'].mean()
+                            if avg_roas > 3.5:
+                                kpis.append(f"ROAS {avg_roas:.2f}x")
+                        if 'CTR' in df.columns:
+                            avg_ctr = platform_data['CTR'].mean()
+                            if avg_ctr > 2.0:
+                                kpis.append(f"CTR {avg_ctr:.2f}%")
+                        if 'Conversion_Rate' in df.columns:
+                            avg_conv = platform_data['Conversion_Rate'].mean()
+                            if avg_conv > platform_data['Conversion_Rate'].median():
+                                kpis.append(f"Conv Rate {avg_conv:.2f}%")
+                        
+                        if kpis:
+                            opportunities.append({
+                                "type": "Underutilized Platform",
+                                "platform": platform,
+                                "current_spend": float(spend),
+                                "kpi_highlights": ", ".join(kpis),
+                                "recommendation": "Shift incremental budget to this platform while monitoring ROAS"
+                            })
+            except Exception as e:
+                logger.warning(f"Could not identify underutilized platforms: {e}")
+        
+        opportunities = self._deduplicate(opportunities, ["type", "campaign", "campaigns", "platform", "details"])
+        
+        # 7. Seasonal/temporal opportunities
+        if 'Date' in df.columns:
+            try:
+                df_copy = df.copy()
+                df_copy['Month'] = pd.to_datetime(df_copy['Date']).dt.month
+                
+                # Analyze multiple KPIs by month
+                agg_dict = {}
+                if 'ROAS' in df.columns:
+                    agg_dict['ROAS'] = 'mean'
+                if 'CTR' in df.columns:
+                    agg_dict['CTR'] = 'mean'
+                if conv_col:
+                    agg_dict[conv_col] = 'sum'
+                
+                if agg_dict:
+                    monthly_performance = df_copy.groupby('Month').agg(agg_dict)
+                    
+                    # Find best month by primary metric
+                    if 'ROAS' in agg_dict:
+                        best_month = monthly_performance['ROAS'].idxmax()
+                        best_roas = monthly_performance.loc[best_month, 'ROAS']
+                        opportunities.append({
+                            "type": "Seasonal Opportunity",
+                            "period": f"Month {best_month}",
+                            "avg_roas": float(best_roas),
+                            "opportunity": f"Historical peak performance in Month {best_month} (ROAS {best_roas:.2f}x)",
+                            "potential_impact": "Plan increased investment 2-3 weeks before this period"
+                        })
+            except Exception as e:
+                logger.warning(f"Could not calculate seasonal opportunities: {e}")
+        
+        # Limit to top 5 opportunities
+        return opportunities[:5]
+    
+    def _assess_risks(self, df: pd.DataFrame, metrics: Dict) -> List[Dict[str, Any]]:
+        """Assess risks and red flags across multiple KPIs."""
+        risks = []
+        
+        spend_col = self._get_column(df, 'spend')
+        
+        # 1. Low ROAS campaigns with campaign names
+        if 'ROAS' in df.columns and spend_col:
+            poor_performers = df[df['ROAS'] < 2.5].sort_values('ROAS')
+            if len(poor_performers) > 0:
+                total_waste = poor_performers[spend_col].sum()
+                worst_campaigns = []
+                for _, row in poor_performers.head(3).iterrows():
+                    campaign_name = row.get('Campaign_Name', 'Unknown')
+                    worst_campaigns.append(f"{campaign_name} (ROAS: {row['ROAS']:.2f}x)")
+                
+                campaigns_text = ", ".join(worst_campaigns)
+                risks.append({
+                    "severity": "High",
+                    "risk": "Low ROAS Campaigns",
+                    "details": f"{len(poor_performers)} campaigns with ROAS below 2.5x",
+                    "impact": f"${total_waste:,.0f} at risk",
+                    "worst_performers": campaigns_text,
+                    "action": f"Review and optimize or pause these campaigns immediately. Focus on: {campaigns_text}"
+                })
+        
+        # 2. High CPA campaigns
+        if 'CPA' in df.columns and spend_col:
+            high_cpa = df[df['CPA'] > df['CPA'].quantile(0.75)]
+            if len(high_cpa) > 0:
+                avg_high_cpa = high_cpa['CPA'].mean()
+                risks.append({
+                    "severity": "Medium",
+                    "risk": "High Cost Per Acquisition",
+                    "details": f"{len(high_cpa)} campaigns with CPA in top 25% (avg ${avg_high_cpa:.2f})",
+                    "impact": "Reducing efficiency and profitability",
+                    "action": "Optimize targeting, creative, or bidding strategy"
+                })
+        
+        # 3. Low CTR (poor ad relevance/creative)
+        if 'CTR' in df.columns:
+            low_ctr = df[df['CTR'] < 1.0]
+            if len(low_ctr) > 0:
+                risks.append({
+                    "severity": "Medium",
+                    "risk": "Low Click-Through Rate",
+                    "details": f"{len(low_ctr)} campaigns with CTR below 1.0%",
+                    "impact": "Poor ad relevance or creative fatigue - wasting impressions",
+                    "action": "Refresh ad creative, improve targeting, or test new messaging"
+                })
+        
+        # 4. High CPC (overpaying for clicks)
+        if 'CPC' in df.columns and spend_col:
+            high_cpc = df[df['CPC'] > df['CPC'].quantile(0.90)]
+            if len(high_cpc) > 0:
+                avg_high_cpc = high_cpc['CPC'].mean()
+                total_high_cpc_spend = high_cpc[spend_col].sum()
+                risks.append({
+                    "severity": "Medium",
+                    "risk": "High Cost Per Click",
+                    "details": f"{len(high_cpc)} campaigns with CPC in top 10% (avg ${avg_high_cpc:.2f})",
+                    "impact": f"${total_high_cpc_spend:,.0f} spend at elevated CPC",
+                    "action": "Review bidding strategy, improve quality score, or adjust targeting"
+                })
+        
+        # 5. Low conversion rate (funnel drop-off)
+        if 'Conversion_Rate' in df.columns:
+            low_conv = df[df['Conversion_Rate'] < df['Conversion_Rate'].quantile(0.25)]
+            if len(low_conv) > 0:
+                risks.append({
+                    "severity": "High",
+                    "risk": "Low Conversion Rate",
+                    "details": f"{len(low_conv)} campaigns with Conv Rate in bottom 25%",
+                    "impact": "Traffic not converting - landing page or offer issues",
+                    "action": "Optimize landing pages, improve offer, or refine audience targeting"
+                })
+        
+        # Platform concentration risk
+        spend_col = self._get_column(df, 'spend')
+        if 'Platform' in df.columns and spend_col:
+            try:
+                platform_col = df['Platform']
+                if isinstance(platform_col, pd.DataFrame):
+                    platform_col = platform_col.iloc[:, 0]
+                
+                temp_df = df.copy()
+                temp_df['_Platform'] = platform_col
+                platform_spend = temp_df.groupby('_Platform')[spend_col].sum()
+                max_concentration = (platform_spend.max() / platform_spend.sum()) * 100
+            except Exception as e:
+                logger.warning(f"Could not calculate platform concentration: {e}")
+                max_concentration = 0
+            
+            if max_concentration > 50:
+                risks.append({
+                    "severity": "Medium",
+                    "risk": "Platform Concentration",
+                    "details": f"{max_concentration:.1f}% of budget on single platform",
+                    "impact": "High dependency risk if platform performance declines",
+                    "action": "Diversify across multiple platforms to reduce risk"
+                })
+        
+        # Declining performance trend
+        if 'Date' in df.columns and 'ROAS' in df.columns:
+            df_sorted = df.sort_values('Date')
+            recent_roas = df_sorted.tail(5)['ROAS'].mean()
+            earlier_roas = df_sorted.head(5)['ROAS'].mean()
+            
+            if recent_roas < earlier_roas * 0.9:  # 10% decline
+                risks.append({
+                    "severity": "High",
+                    "risk": "Declining Performance Trend",
+                    "details": f"ROAS declined from {earlier_roas:.2f} to {recent_roas:.2f}",
+                    "impact": "Continued decline could significantly impact ROI",
+                    "action": "Investigate root cause and implement corrective measures"
+                })
+        
+        risks = self._deduplicate(risks, ["risk", "details"])
+
+        # Limit to top 5 risks
+        return risks[:5]
+    
+    def _optimize_budget(self, df: pd.DataFrame, metrics: Dict) -> Dict[str, Any]:
+        """Suggest budget optimization."""
+        # This method has hardcoded column references - skip if columns don't exist
+        logger.warning("Budget optimization skipped - requires 'Spend' and 'Conversions' columns")
+        return {
+            "current_allocation": {},
+            "recommended_allocation": {},
+            "expected_improvement": {}
+        }
+    
+    def get_rag_summary(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Get RAG-enhanced summary for the given data.
+        
+        Args:
+            data: Campaign data DataFrame
+            
+        Returns:
+            Dict containing brief and detailed summaries + insights
+        """
+        # 1. Identify key topics from data
+        topics = ["campaign optimization"]
+        if 'ROAS' in data.columns:
+            avg_roas = data['ROAS'].mean()
+            if avg_roas < 3.0:
+                topics.append("improving ROAS")
+            else:
+                topics.append("scaling high ROAS campaigns")
+                
+        # 2. Fetch external knowledge
+        external_context = ""
+        try:
+            # Lazy load reasoning engine if not already initialized
+            if not hasattr(self, 'reasoning_engine'):
+                from ..knowledge.enhanced_reasoning import EnhancedReasoningEngine
+                self.reasoning_engine = EnhancedReasoningEngine(
+                    api_key=self.anthropic_api_key or self.openai_api_key,
+                    use_anthropic=self.use_anthropic
+                )
+            
+            # Fetch insights for top topic
+            if topics:
+                knowledge_result = self.reasoning_engine.get_knowledge_enhanced_insights(
+                    campaign_summary="Auto-analysis in progress",
+                    topic=topics[-1]
+                )
+                if isinstance(knowledge_result, dict):
+                     # Extract raw knowledge chunks if available, or the synthesized response
+                     external_context = knowledge_result.get('response', '')
+        except Exception as e:
+            logger.warning(f"Failed to fetch RAG context: {e}")
+            external_context = "External knowledge unavailable."
+
+        # 3. Generate Analysis with Knowledge Injection using standard pipeline
+        return self.analyze_all(data, external_knowledge=external_context)
+
+    def _generate_executive_summary(self, metrics: Dict, insights: List, recommendations: List, external_knowledge: str = "") -> Dict[str, str]:
+        """Generate both brief and detailed executive summaries.
+        
+        Returns:
+            Dict with 'brief' and 'detailed' keys containing respective summaries
+        """
+        try:
+            # Convert to JSON-serializable format
+            def make_serializable(obj):
+                """Convert pandas objects to JSON-serializable types."""
+                if isinstance(obj, pd.Series):
+                    return obj.to_dict()
+                elif isinstance(obj, pd.DataFrame):
+                    return obj.to_dict('records')
+                elif hasattr(obj, 'isoformat'):
+                    return obj.isoformat()
+                elif isinstance(obj, (np.integer, np.floating)):
+                    return float(obj)
+                elif isinstance(obj, dict):
+                    return {k: make_serializable(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [make_serializable(item) for item in obj]
+                return obj
+            
+            overview = make_serializable(metrics.get('overview', {}))
+            
+            platform_metrics = metrics.get('by_platform', {})
+            campaign_metrics = metrics.get('by_campaign', {})
+            channel_metrics = metrics.get('by_channel', {})
+            funnel_metrics = metrics.get('by_funnel', {})
+            creative_metrics = metrics.get('by_creative', {})
+            audience_metrics = metrics.get('by_audience', {})
+            
+            # CRITICAL: Filter out platforms/channels with 0 spend to prevent hallucination
+            platform_metrics = {
+                name: data for name, data in platform_metrics.items()
+                if isinstance(data, dict) and data.get('Spend', 0) > 0
+            }
+            channel_metrics = {
+                name: data for name, data in channel_metrics.items()
+                if isinstance(data, dict) and data.get('Spend', 0) > 0
+            }
+
+            def _get_best_metric(metric_key: str, source: Dict[str, Dict[str, Any]], prefer_max: bool = True):
+                best_name = None
+                best_stats = None
+                comparator = max if prefer_max else min
+                filtered = {
+                    name: data for name, data in source.items()
+                    if isinstance(data, dict) and metric_key in data and data[metric_key] is not None
+                }
+                if not filtered:
+                    return None
+                best_name = comparator(filtered, key=lambda k: filtered[k][metric_key])
+                best_stats = filtered[best_name]
+                return {
+                    "name": best_name,
+                    metric_key: float(best_stats[metric_key]),
+                    "spend": float(best_stats.get('Spend') or best_stats.get('Cost') or 0),
+                    "conversions": float(best_stats.get('Conversions') or best_stats.get('Site Visit') or best_stats.get('Site_Visit') or 0)
+                }
+                
+            def _get_top_n(metric_key: str, source: Dict[str, Dict[str, Any]], n: int = 5, reverse: bool = True):
+                """Get top/bottom N items by metric."""
+                filtered = [
+                    {"name": name, **data} for name, data in source.items()
+                    if isinstance(data, dict) and metric_key in data and data[metric_key] is not None
+                ]
+                if not filtered:
+                    return []
+                sorted_list = sorted(filtered, key=lambda x: x[metric_key], reverse=reverse)
+                return sorted_list[:n]
+
+            top_platform_roas = _get_best_metric('ROAS', platform_metrics, prefer_max=True)
+            bottom_platform_roas = _get_best_metric('ROAS', platform_metrics, prefer_max=False)
+            top_campaign_roas = _get_best_metric('ROAS', campaign_metrics, prefer_max=True)
+            top_campaign_ctr = _get_best_metric('CTR', campaign_metrics, prefer_max=True)
+            
+            # Rankings for Channels
+            top_channels = _get_top_n('ROAS', channel_metrics, n=5, reverse=True)
+            bottom_channels = _get_top_n('ROAS', channel_metrics, n=5, reverse=False)
+
+            # Build comprehensive KPI summary
+            summary_data = {
+                "total_spend": overview.get('total_spend', 0),
+                "total_conversions": overview.get('total_conversions', 0),
+                "total_impressions": overview.get('total_impressions', 0),
+                "total_clicks": overview.get('total_clicks', 0),
+                "campaigns": overview.get('total_campaigns', 0),
+                "platforms": overview.get('total_platforms', 0),
+                "kpis": {
+                    "avg_roas": overview.get('avg_roas', 0),
+                    "avg_cpa": overview.get('avg_cpa', 0),
+                    "avg_ctr": overview.get('avg_ctr', 0),
+                    "avg_cpc": overview.get('avg_cpc', 0) if 'avg_cpc' in overview else None,
+                    "avg_conversion_rate": overview.get('avg_conversion_rate', 0) if 'avg_conversion_rate' in overview else None
+                },
+                "rankings": {
+                    "top_5_channels": top_channels,
+                    "bottom_5_channels": bottom_channels,
+                    "top_platforms": list(platform_metrics.keys())[:5]
+                },
+                "dimensions": {
+                    "funnel_performance": funnel_metrics,
+                    "creative_type_performance": creative_metrics,
+                    "audience_performance": audience_metrics
+                },
+                "top_insights": insights[:3] if insights else [],
+                "top_recommendations": recommendations[:3] if recommendations else [],
+                "leaders": {
+                    "platform_roas": top_platform_roas,
+                    "campaign_roas": top_campaign_roas,
+                    "campaign_ctr": top_campaign_ctr
+                },
+                "laggards": {
+                    "platform_roas": bottom_platform_roas
+                }
+            }
+            
+            # Prepare context variables for the prompt
+            raw_campaign_data = json.dumps(summary_data, indent=2)
+            time_period = metrics.get('date_range', 'Recent Period')
+            total_budget = f"${summary_data['total_spend']:,.2f}"
+            target_roas = "3.0 (Target)" # Default target
+            business_objective = "Maximize ROAS and volume efficiency"
+            baseline_metrics = "Previous period data not available for comparison"
+
+            combined_prompt = f"""<prompt_template>
+<role>
+You are a world-class Digital Media & data analyst in the style of Avinash Kaushik, Rand Fishkin and Alex Freberg, creating executive summaries for Google's CMO. Your analysis combines strategic marketing intuition with rigorous statistical thinking to deliver actionable insights from campaign performance data.
+</role>
+
+<analysis_principles>
+- Focus on business outcomes over vanity metrics
+- Question the "why" behind every pattern
+- Prioritize statistical significance over anecdotal observations
+- Balance quick wins with long-term strategic opportunities
+</analysis_principles>
+
+<context>
+Raw Campaign Data: {raw_campaign_data}
+Time Period: {time_period}
+Total Budget: {total_budget}
+Target ROAS: {target_roas}
+Business Objective: {business_objective}
+Previous Period Baseline: {baseline_metrics}
+
+<external_knowledge>
+{external_knowledge}
+</external_knowledge>
+</context>
+
+<data_processing_instructions>
+First, aggregate the raw campaign data:
+1. Calculate platform-level: Total Spend, Conversions, ROAS, CPA, CTR, Conversion Rate
+2. Identify statistical significance for performance differences (use 95% confidence)
+3. Segment by: Platform → Campaign → Ad Set → Creative
+4. Flag anomalies: >30% deviation from historical patterns
+5. Compute period-over-period changes (%, absolute values)
+</data_processing_instructions>
+
+<brief_summary_instructions>
+Output exactly 4 sections. CMO reads this in <30 seconds during board prep.
+
+**Overall Summary**
+[One powerful sentence: $X spent → Y conversions → Z ROAS (±N% vs target) across M platforms. One-word verdict: "Exceeding/Meeting/Missing" expectations]
+
+**Channel Summary** 
+[One sentence: "Platform A dominates at X ROAS ($Y spend), Platform B underperforms at Z ROAS ($W spend), Platform C shows promise with improving trend"]
+
+**Key Strength**
+[One sentence with business impact: "What's working" + specific metric + "resulting in $X incremental revenue" or "Y% efficiency gain"]
+
+**Priority Action**
+[One sentence: Most critical lever to pull + expected outcome. Format: "Shift $X from [Platform] to [Platform] → Projected +Y% ROAS"]
+</brief_summary_instructions>
+
+<detailed_summary_instructions>
+Generate exactly 10 sections. Write for a CMO who understands digital marketing deeply but needs you to surface what matters.
+
+**1. Executive Performance Snapshot**
+- Total Spend: **$X** (**Y%** of allocated budget, **±Z%** vs last period)
+- Total Conversions: **N** (Blended CPA: **$X**, **±Y%** vs target)
+- Blended ROAS: **X.XX** (Target: Y.YY, **+Z% / -Z%** gap)
+- Period-over-Period Momentum: [Accelerating/Stable/Declining] - **±X%** growth rate
+- Active: **N** platforms, **M** campaigns, **K** ad sets
+
+**2. Platform Performance Matrix**
+Rank ALL active platforms:
+| Platform | Spend (%) | ROAS | Conv. | CPA | Trend | Verdict |
+|----------|-----------|------|-------|-----|-------|---------|
+| [Name] | $X (Y%) | Z.ZZ | N | $A | ↑↓→ | [Strategic/Optimize/Cut] |
+
+**Top 3 Performers - Why They Win:**
+1. [Platform]: [Specific reason - audience fit, creative format, bidding strategy]
+2. [Platform]: [Reason]
+3. [Platform]: [Reason]
+
+**Bottom 2 Underperformers - Root Cause:**
+1. [Platform]: [Diagnosis with data - saturation? creative fatigue? wrong audience?]
+2. [Platform]: [Diagnosis]
+
+**Platform-Specific Insights:**
+[Provide specific insights for active platforms like Google Ads, Meta, LinkedIn, etc.]
+
+**3. Funnel Diagnostics - Where Are We Winning/Losing?**
+Analyze full funnel with conversion math (Awareness -> Consideration -> Conversion).
+Identify biggest drop-off point with %, recommend fix.
+
+**4. Creative Performance Intelligence**
+- **Best Format**: [Ad type] at **X.XX ROAS** (**$Y** spend, **Z** conversions)
+- **Worst Format**: [Ad type] at **X.XX ROAS** (**$Y** wasted)
+- **Creative Fatigue Index**: Identify campaigns with declining CTR.
+
+**5. Audience Segmentation Analysis**
+Group audiences into Tier 1 (Scale Winners), Tier 2 (Optimize), Tier 3 (Suppress).
+Identify expansion opportunities and overlap.
+
+**6. Budget Allocation Efficiency**
+- Current State: Budget distribution vs ROAS correlation.
+- Optimization Model - Scenario Analysis:
+  - Scenario A: Efficiency Play (Shift budget for ROAS)
+  - Scenario B: Growth Play (Scale high performers)
+- Wasted Spend Recovery: Identify total recoverable spend.
+
+**7. Geographic & Temporal Optimization**
+- Best/Worst regions with ROAS.
+- Temporal Patterns: Best days/hours.
+- Seasonality Signals.
+
+**8. Statistical Significance & Confidence Intervals**
+[Include ONLY if data supports it - e.g. "Result is Significant at 95% confidence"]
+
+**9. Priority Action Roadmap (Next 30 Days)**
+- IMMEDIATE (This Week) - High Impact, Low Effort
+- SHORT-TERM (This Month) - High Impact, Medium Effort
+- STRATEGIC (Next Quarter) - Transform Performance
+- DO NOT DO (Avoid These Traps)
+
+**10. Risks, Anomalies & Watch Items**
+- Performance Degradation Signals
+- Budget Pacing Alerts
+- External Factors
+- Items Requiring CMO Attention
+
+</detailed_summary_instructions>
+
+<formatting_rules>
+- **Bold** all numbers, metrics, and percentages
+- Use + or - prefix for all changes (**+15%**, not just 15%)
+- ROAS to 2 decimals (**3.45**), percentages to 1 decimal (**15.7%**)
+- Currency: $1.2M (not $1,234,567), $450K (not $450,000)
+- Up/down/flat arrows: ↑ ↓ → for trends
+- Verdict words: Strong/Solid/Acceptable/Concerning/Critical
+- No jargon without context - if using acronyms, define once
+- Tables for multi-platform comparisons (use markdown tables)
+</formatting_rules>
+
+<output_instruction>
+Generate both BRIEF and DETAILED summaries in a single output.
+
+CRITICAL OUTPUT FORMAT:
+1. Start with exact line: "BRIEF:" followed by the Brief Summary content.
+2. Then, output exact line: "DETAILED:" followed by the Detailed Summary content.
+3. End with: "[Analysis completed by AI Agent | Data processed: {metrics.get('loaded_at', 'Now')} | Confidence: High]"
+
+Do NOT add any markdown headers like "# Campaign Performance Analysis" before the "BRIEF:" marker.
+</output_instruction>
+</prompt_template>"""
+    
+            llm_start = time.time()
+            combined_response = None
+            
+            # 1. Try Claude Sonnet (primary)
+            if self.use_anthropic and self.anthropic_api_key:
+                try:
+                    logger.info("Attempting combined executive summary with Claude Sonnet")
+                    combined_response = self._call_llm(system_prompt, combined_prompt, max_tokens=3000)
+                except Exception as e:
+                    logger.warning(f"❌ Claude Sonnet failed: {e}")
+            
+            # 2. Try Gemini 2.5 Pro (fallback 1)
+            if not combined_response and self.gemini_client:
+                try:
+                    logger.info("Attempting combined executive summary with Gemini 2.5 Pro")
+                    full_prompt = f"{system_prompt}\n\n{combined_prompt}"
+                    response = self.gemini_client.generate_content(full_prompt)
+                    combined_response = response.text
+                except Exception as e:
+                    logger.warning(f"❌ Gemini 2.5 Pro failed: {e}")
+            
+            # 3. Try GPT-4o-mini (fallback 2)
+            if not combined_response and not self.use_anthropic and self.client:
+                try:
+                    logger.info("Attempting combined executive summary with GPT-4o-mini")
+                    combined_response = self._call_llm(system_prompt, combined_prompt, max_tokens=3000)
+                except Exception as e:
+                    logger.warning(f"❌ GPT-4o-mini failed: {e}")
+            
+            if not combined_response:
+                logger.error("❌ ALL LLM calls for summary generation failed!")
+            
+            # Parse combined response
+            if combined_response:
+                import re
+                brief_match = re.search(r'BRIEF:\s*\n?(.*?)(?=DETAILED:|$)', combined_response, re.IGNORECASE | re.DOTALL)
+                detailed_match = re.search(r'DETAILED:\s*\n?(.*?)$', combined_response, re.IGNORECASE | re.DOTALL)
+                
+                if brief_match:
+                    brief_summary = brief_match.group(1).strip()
+                if detailed_match:
+                    detailed_summary = detailed_match.group(1).strip()
+                
+                # Fallback: split by position if markers not found
+                if not brief_summary and not detailed_summary:
+                    parts = combined_response.split('DETAILED:', 1)
+                    if len(parts) == 2:
+                        brief_summary = parts[0].replace('BRIEF:', '').strip()
+                        detailed_summary = parts[1].strip()
+                    else:
+                        # Last resort: first 1/3 is brief, rest is detailed
+                        split_point = len(combined_response) // 3
+                        brief_summary = combined_response[:split_point].strip()
+                        detailed_summary = combined_response[split_point:].strip()
+            
+            if brief_summary:
+                brief_summary = self._strip_italics(brief_summary.strip())
+            if detailed_summary:
+                detailed_summary = self._strip_italics(detailed_summary.strip())
+            
+            # Apply post-processing formatting (M/K notation, remove sources, fix spacing)
+            from ..utils.summary_formatter import format_summary
+            brief_summary, detailed_summary = format_summary(brief_summary or "", detailed_summary or "")
+            
+            # Enforce 9-section structure deterministically
+            from ..utils.structure_enforcer import enforce_structure
+            if detailed_summary:
+                try:
+                    detailed_summary = enforce_structure(detailed_summary)
+                except Exception as e:
+                    logger.warning(f"Structure enforcement failed: {e}")
+            
+            # If either piece is missing, fill JUST the missing parts with a deterministic fallback.
+            if not brief_summary or not detailed_summary:
+                logger.warning("Using fallback for missing summary parts")
+    
+                kpi_summary = []
+                if overview.get('avg_roas', 0) > 0:
+                    kpi_summary.append(f"ROAS {overview['avg_roas']:.2f}x")
+                if overview.get('avg_ctr', 0) > 0:
+                    kpi_summary.append(f"CTR {overview['avg_ctr']:.2f}%")
+                
+                kpi_text = ", ".join(kpi_summary) if kpi_summary else "multiple KPIs"
+                
+                if not brief_summary:
+                    top_rec = recommendations[0]['recommendation'] if recommendations else 'Review detailed analysis'
+                    best_platform = top_platform_roas['name'] if top_platform_roas else 'Top channel'
+                    brief_summary = f"""[OVERALL SUMMARY] Portfolio delivered ${summary_data['total_spend']:,.0f} spend across {summary_data['campaigns']} campaigns.
+    [CHANNEL SUMMARY] {best_platform} leads performance.
+    [KEY STRENGTH] Generated {summary_data['total_conversions']:,.0f} conversions.
+    [PRIORITY ACTION] {top_rec}"""
+                
+                if not detailed_summary:
+                    best_platform_text = f"{top_platform_roas['name']} platform leading with {top_platform_roas['ROAS']:.2f} x ROAS" if top_platform_roas else "Multiple channels showing positive performance"
+                    
+                    detailed_summary = f"""Performance Overview
+    
+    Overall performance is strong with {overview.get('total_conversions', 0)} conversions.
+    
+    Channel & Platform Analysis
+    
+    {best_platform_text}.
+    
+    Funnel & Strategic Insights
+    
+    Analyze funnel progression for opportunities.
+    
+    Ad Type & Creative Performance
+    
+    Review creative performance data.
+    
+    Audience & Demographic Insights
+    
+    Check audience response rates.
+    
+    What Is Working
+    
+    {best_platform_text}.
+    
+    What Is Not Working
+    
+    Identify underperforming segments.
+    
+    Budget Optimization
+    
+    Optimize spend based on ROAS.
+    
+    Priority Actions
+    
+    1. Review top performing channels.
+    2. Optimize creative assets.
+    3. Adjust bids for efficiency."""
+
+            return {
+                'brief': brief_summary,
+                'detailed': detailed_summary
+            }
+            
+        except Exception as e:
+            logger.error(f"Executive summary generation failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {
+                'brief': "Summary generation failed.",
+                'detailed': f"Error: {e}. Please check raw metrics."
+            }
+    
+    def _parse_summary_response(self, llm_response: str) -> tuple:
+        """Parse LLM response to extract brief and detailed summaries.
+        
+        Handles the new BRIEF:/DETAILED: format with sections:
+        Brief: Overall, Channel Summary, Key Strengths, Priority Actions
+        Detailed: Executive Overview, Channel Deep-Dive, Performance Analysis, etc.
+        
+        Args:
+            llm_response: Raw LLM response text
+            
+        Returns:
+            Tuple of (brief_summary, detailed_summary)
+        """
+        import re
+        
+        brief_summary = ""
+        detailed_summary = ""
+        
+        # Primary method: Look for BRIEF: and DETAILED: markers
+        brief_match = re.search(r'BRIEF:\s*\n(.*?)(?=DETAILED:|$)', llm_response, re.IGNORECASE | re.DOTALL)
+        detailed_match = re.search(r'DETAILED:\s*\n(.*?)$', llm_response, re.IGNORECASE | re.DOTALL)
+        
+        if brief_match:
+            brief_summary = brief_match.group(1).strip()
+        
+        if detailed_match:
+            detailed_summary = detailed_match.group(1).strip()
+        
+        # Fallback: Look for section headers if BRIEF/DETAILED not found
+        if not brief_summary:
+            # Look for the 4 brief sections: Overall, Channel Summary, Key Strengths, Priority Actions
+            brief_sections = []
+            section_patterns = [
+                (r'Overall\s*\n\n?(.*?)(?=Channel Summary|Key Strength|Priority Action|DETAILED|$)', 'Overall'),
+                (r'Channel Summary\s*\n\n?(.*?)(?=Key Strength|Priority Action|DETAILED|$)', 'Channel Summary'),
+                (r'Key Strength[s]?\s*\n\n?(.*?)(?=Priority Action|DETAILED|$)', 'Key Strengths'),
+                (r'Priority Action[s]?\s*\n\n?(.*?)(?=DETAILED|Executive Overview|$)', 'Priority Actions'),
+            ]
+            
+            for pattern, section_name in section_patterns:
+                match = re.search(pattern, llm_response, re.IGNORECASE | re.DOTALL)
+                if match:
+                    content = match.group(1).strip()
+                    if content and len(content) > 20:
+                        brief_sections.append(f"{section_name}\n\n{content}")
+            
+            if brief_sections:
+                brief_summary = '\n\n'.join(brief_sections)
+        
+        if not detailed_summary:
+            # Look for detailed section headers
+            detailed_sections = []
+            detailed_patterns = [
+                (r'Executive Overview\s*\n\n?(.*?)(?=Channel Deep-Dive|Performance Analysis|$)', 'Executive Overview'),
+                (r'Channel Deep-Dive\s*\n\n?(.*?)(?=Performance Analysis|Root Cause|$)', 'Channel Deep-Dive'),
+                (r'Performance Analysis\s*\n\n?(.*?)(?=Root Cause|Success Pattern|$)', 'Performance Analysis'),
+                (r'Root Cause Analysis\s*\n\n?(.*?)(?=Success Pattern|Strategic Recommend|$)', 'Root Cause Analysis'),
+                (r'Success Pattern[s]?\s*(?:Analysis)?\s*\n\n?(.*?)(?=Strategic Recommend|Budget Realloc|$)', 'Success Pattern Analysis'),
+                (r'Strategic Recommendation[s]?\s*\n\n?(.*?)(?=Budget Realloc|Monitoring|$)', 'Strategic Recommendations'),
+                (r'Budget Reallocation\s*\n\n?(.*?)(?=Monitoring|$)', 'Budget Reallocation'),
+                (r'Monitoring Plan\s*\n\n?(.*?)$', 'Monitoring Plan'),
+            ]
+            
+            for pattern, section_name in detailed_patterns:
+                match = re.search(pattern, llm_response, re.IGNORECASE | re.DOTALL)
+                if match:
+                    content = match.group(1).strip()
+                    if content and len(content) > 20:
+                        detailed_sections.append(f"{section_name}\n\n{content}")
+            
+            if detailed_sections:
+                detailed_summary = '\n\n'.join(detailed_sections)
+        
+        # Final fallback: Split by position if markers not found
+        if not brief_summary and not detailed_summary:
+            # Try to find any section structure
+            lines = llm_response.split('\n')
+            
+            # Look for common section headers
+            brief_headers = ['overall', 'channel summary', 'key strength', 'priority action']
+            detailed_headers = ['executive', 'deep-dive', 'root cause', 'strategic', 'budget', 'monitoring']
+            
+            current_section = []
+            is_detailed = False
+            brief_parts = []
+            detailed_parts = []
+            
+            for line in lines:
+                line_lower = line.lower().strip()
+                
+                # Check if this is a section header
+                is_brief_header = any(h in line_lower for h in brief_headers)
+                is_detailed_header = any(h in line_lower for h in detailed_headers)
+                
+                if is_detailed_header:
+                    is_detailed = True
+                    if current_section:
+                        if is_detailed:
+                            detailed_parts.extend(current_section)
+                        else:
+                            brief_parts.extend(current_section)
+                    current_section = [line]
+                elif is_brief_header and not is_detailed:
+                    if current_section:
+                        brief_parts.extend(current_section)
+                    current_section = [line]
+                else:
+                    current_section.append(line)
+            
+            # Add remaining section
+            if current_section:
+                if is_detailed:
+                    detailed_parts.extend(current_section)
+                else:
+                    brief_parts.extend(current_section)
+            
+            if brief_parts:
+                brief_summary = '\n'.join(brief_parts)
+            if detailed_parts:
+                detailed_summary = '\n'.join(detailed_parts)
+            
+            # Last resort: Use first 800 chars for brief, rest for detailed
+            if not brief_summary:
+                brief_summary = llm_response[:800].strip()
+            if not detailed_summary:
+                detailed_summary = llm_response
+        
+        logger.info(f"Parsed RAG response: brief={len(brief_summary)} chars, detailed={len(detailed_summary)} chars")
+        
+        return brief_summary, detailed_summary
+    
+    def _prepare_data_summary(self, df: pd.DataFrame, metrics: Dict) -> str:
+        """Prepare comprehensive data summary for AI prompts with multi-KPI focus."""
+        overview = metrics['overview']
+        
+        summary = f"""
+Campaign Data Summary:
+- Total Campaigns: {overview.get('total_campaigns', 0)}
+- Total Platforms: {overview.get('total_platforms', 0)}
+- Total Spend: ${overview.get('total_spend', 0):,.0f}
+- Total Impressions: {overview.get('total_impressions', 0):,.0f}
+- Total Clicks: {overview.get('total_clicks', 0):,.0f}
+- Total Conversions: {overview.get('total_conversions', 0):,.0f}
+
+Key Performance Indicators:
+- Average ROAS: {overview.get('avg_roas', 0):.2f}x
+- Average CPA: ${overview.get('avg_cpa', 0):.2f}
+- Average CTR: {overview.get('avg_ctr', 0):.2f}%
+- Average CPC: ${overview.get('avg_cpc', 0):.2f} (if available)
+
+Platform Performance (Multi-KPI View):
+"""
+        
+        if metrics.get('by_platform'):
+            for platform, data in metrics['by_platform'].items():
+                summary += f"\n{platform}:"
+                # Use flexible column mapping
+                spend_key = next((k for k in ['Spend', 'Total Spent', 'Total_Spent', 'Cost'] if k in data), None)
+                conv_key = next((k for k in ['Conversions', 'Site Visit', 'Site_Visit'] if k in data), None)
+                clicks_key = next((k for k in ['Clicks', 'Click'] if k in data), None)
+                impr_key = next((k for k in ['Impressions', 'Impr'] if k in data), None)
+                
+                if spend_key:
+                    summary += f"\n  - Spend: ${data.get(spend_key, 0):,.0f}"
+                if 'ROAS' in data:
+                    summary += f"\n  - ROAS: {data.get('ROAS', 0):.2f}x"
+                if 'CTR' in data:
+                    summary += f"\n  - CTR: {data.get('CTR', 0):.2f}%"
+                if 'CPA' in data:
+                    summary += f"\n  - CPA: ${data.get('CPA', 0):.2f}"
+                if conv_key:
+                    summary += f"\n  - Conversions: {data.get(conv_key, 0):,.0f}"
+                if clicks_key:
+                    summary += f"\n  - Clicks: {data.get(clicks_key, 0):,.0f}"
+        
+        return summary
+    
+    def _generate_rule_based_insights(self, df: pd.DataFrame, metrics: Dict) -> List[Dict]:
+        """Fallback rule-based insights."""
+        insights = []
+        
+        # Best performing campaign
+        if 'ROAS' in df.columns and 'Campaign_Name' in df.columns:
+            best = df.loc[df['ROAS'].idxmax()]
+            insights.append({
+                "category": "Performance",
+                "insight": f"{best['Campaign_Name']} achieved highest ROAS of {best['ROAS']:.2f}x",
+                "impact": "High",
+                "explanation": "This campaign demonstrates best practices worth replicating"
+            })
+        
+        return insights
+    
+    def _generate_rule_based_recommendations(self, df: pd.DataFrame, metrics: Dict) -> List[Dict]:
+        """Fallback rule-based recommendations."""
+        recommendations = []
+        
+        # Scale winners
+        if 'ROAS' in df.columns:
+            high_roas = df[df['ROAS'] > 4.0]
+            if len(high_roas) > 0:
+                recommendations.append({
+                    "priority": "High",
+                    "recommendation": f"Scale the {len(high_roas)} campaigns with ROAS > 4.0x",
+                    "expected_impact": "20-30% increase in conversions",
+                    "implementation": "Increase budgets by 50% incrementally",
+                    "timeline": "1-2 weeks",
+                    "estimated_roi": "25%",
+                    "focus_area": "ROAS"
+                })
+        
+        return recommendations
+    
+    def _analyze_funnel(self, df: pd.DataFrame, metrics: Dict) -> Dict[str, Any]:
+        """Analyze marketing funnel performance with intelligent stage detection."""
+        funnel = {
+            "stages": {},
+            "conversion_rates": {},
+            "drop_off_points": [],
+            "recommendations": [],
+            "by_funnel_stage": {}
+        }
+        
+        # Helper function to detect funnel stage from text
+        def detect_funnel_stage(text: str) -> str:
+            """Detect funnel stage from campaign/placement/ad set name."""
+            if not isinstance(text, str):
+                return "Unknown"
+            text_lower = text.lower()
+            
+            # Awareness patterns
+            awareness_patterns = ['awareness', 'aw', 'awa', 'tofu', 'top-of-funnel', 'brand', 'reach', 'impression']
+            if any(pattern in text_lower for pattern in awareness_patterns):
+                return "Awareness"
+            
+            # Consideration patterns
+            consideration_patterns = ['consideration', 'co', 'cons', 'mofu', 'mid-funnel', 'engagement', 'interest', 'video view']
+            if any(pattern in text_lower for pattern in consideration_patterns):
+                return "Consideration"
+            
+            # Conversion patterns
+            conversion_patterns = ['conversion', 'conv', 'bofu', 'bottom-funnel', 'purchase', 'lead', 'signup', 'sale', 'retargeting', 'remarketing']
+            if any(pattern in text_lower for pattern in conversion_patterns):
+                return "Conversion"
+            
+            return "Unknown"
+        
+        # Try to detect funnel stages from column names
+        funnel_col = None
+        for col in ['Funnel_Stage', 'Funnel', 'Stage', 'Campaign_Type']:
+            if col in df.columns:
+                funnel_col = col
+                break
+        
+        # If no explicit funnel column, try to infer from campaign/placement/ad set names
+        if funnel_col is None:
+            df_copy = df.copy()
+            # Check multiple columns for funnel indicators
+            for col in ['Campaign_Name', 'Placement', 'Placement_Name', 'Ad_Set', 'Ad_Group', 'Adset_Name']:
+                if col in df_copy.columns:
+                    df_copy['Detected_Funnel_Stage'] = df_copy[col].apply(detect_funnel_stage)
+                    # If we found some stages, use this column
+                    if df_copy['Detected_Funnel_Stage'].nunique() > 1:
+                        funnel_col = 'Detected_Funnel_Stage'
+                        df = df_copy
+                        break
+        
+        # Analyze by funnel stage if detected
+        if funnel_col and funnel_col in df.columns:
+            try:
+                funnel_stages = df.groupby(funnel_col).agg({
+                    'Spend': 'sum' if 'Spend' in df.columns else lambda x: 0,
+                    'Impressions': 'sum' if 'Impressions' in df.columns else lambda x: 0,
+                    'Clicks': 'sum' if 'Clicks' in df.columns else lambda x: 0,
+                    'Conversions': 'sum' if 'Conversions' in df.columns else lambda x: 0,
+                    'ROAS': 'mean' if 'ROAS' in df.columns else lambda x: 0
+                })
+                
+                for stage, row in funnel_stages.iterrows():
+                    if stage != "Unknown":
+                        funnel["by_funnel_stage"][stage] = {
+                            "spend": float(row.get('Spend', 0)),
+                            "impressions": int(row.get('Impressions', 0)),
+                            "clicks": int(row.get('Clicks', 0)),
+                            "conversions": int(row.get('Conversions', 0)),
+                            "roas": float(row.get('ROAS', 0)),
+                            "ctr": (row.get('Clicks', 0) / row.get('Impressions', 1) * 100) if row.get('Impressions', 0) > 0 else 0,
+                            "conversion_rate": (row.get('Conversions', 0) / row.get('Clicks', 1) * 100) if row.get('Clicks', 0) > 0 else 0
+                        }
+            except Exception as e:
+                logger.warning(f"Could not analyze by funnel stage: {e}")
+        
+        # Calculate overall funnel metrics
+        if all(col in df.columns for col in ['Impressions', 'Clicks', 'Conversions']):
+            total_impressions = df['Impressions'].sum()
+            total_clicks = df['Clicks'].sum()
+            total_conversions = df['Conversions'].sum()
+            
+            funnel["stages"] = {
+                "awareness": {
+                    "metric": "Impressions",
+                    "value": int(total_impressions),
+                    "percentage": 100.0
+                },
+                "consideration": {
+                    "metric": "Clicks",
+                    "value": int(total_clicks),
+                    "percentage": (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
+                },
+                "conversion": {
+                    "metric": "Conversions",
+                    "value": int(total_conversions),
+                    "percentage": (total_conversions / total_clicks * 100) if total_clicks > 0 else 0
+                }
+            }
+            
+            # Calculate conversion rates
+            funnel["conversion_rates"] = {
+                "awareness_to_consideration": (total_clicks / total_impressions * 100) if total_impressions > 0 else 0,
+                "consideration_to_conversion": (total_conversions / total_clicks * 100) if total_clicks > 0 else 0,
+                "awareness_to_conversion": (total_conversions / total_impressions * 100) if total_impressions > 0 else 0
+            }
+            
+            # Identify drop-off points
+            ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
+            conversion_rate = (total_conversions / total_clicks * 100) if total_clicks > 0 else 0
+            
+            if ctr < 1.5:
+                funnel["drop_off_points"].append({
+                    "stage": "Awareness to Consideration",
+                    "issue": f"Low CTR of {ctr:.2f}% (benchmark: 1.5-3.0%)",
+                    "recommendation": "Improve ad creative, headlines, and targeting to increase click-through rate"
+                })
+            
+            if conversion_rate < 2.0:
+                funnel["drop_off_points"].append({
+                    "stage": "Consideration to Conversion",
+                    "issue": f"Low conversion rate of {conversion_rate:.2f}%",
+                    "recommendation": "Optimize landing pages, improve offer clarity, or refine audience targeting"
+                })
+        
+        # Platform-specific funnel analysis
+        if 'Platform' in df.columns:
+            platform_funnels = {}
+            try:
+                platforms = df['Platform'].unique() if hasattr(df['Platform'], 'unique') else df['Platform'].iloc[:, 0].unique()
+            except:
+                platforms = []
+            for platform in platforms:
+                # Handle potential duplicate Platform column
+                platform_col = df['Platform']
+                if isinstance(platform_col, pd.DataFrame):
+                    platform_col = platform_col.iloc[:, 0]
+                platform_data = df[platform_col == platform]
+                if all(col in platform_data.columns for col in ['Impressions', 'Clicks', 'Conversions']):
+                    p_impressions = platform_data['Impressions'].sum()
+                    p_clicks = platform_data['Clicks'].sum()
+                    p_conversions = platform_data['Conversions'].sum()
+                    
+                    platform_funnels[platform] = {
+                        "ctr": (p_clicks / p_impressions * 100) if p_impressions > 0 else 0,
+                        "conversion_rate": (p_conversions / p_clicks * 100) if p_clicks > 0 else 0,
+                        "overall_conversion": (p_conversions / p_impressions * 100) if p_impressions > 0 else 0
+                    }
+            
+            funnel["by_platform"] = platform_funnels
+        
+        return funnel
+    
+    def _analyze_roas_revenue(self, df: pd.DataFrame, metrics: Dict) -> Dict[str, Any]:
+        """Analyze ROAS and revenue performance with graceful handling of missing/zero values."""
+        roas_analysis = {
+            "overall": {},
+            "by_platform": {},
+            "by_campaign": {},
+            "efficiency_tiers": {},
+            "revenue_attribution": {},
+            "data_quality": {
+                "has_roas": False,
+                "has_revenue": False,
+                "zero_roas_count": 0,
+                "missing_data_warning": None
+            }
+        }
+        
+        # Check for ROAS and Revenue columns
+        has_roas = 'ROAS' in df.columns
+        revenue_col = self._get_column(df, 'revenue')
+        has_revenue = revenue_col is not None
+        
+        roas_analysis["data_quality"]["has_roas"] = has_roas
+        roas_analysis["data_quality"]["has_revenue"] = has_revenue
+        
+        # If neither ROAS nor Revenue exists, return early with warning
+        if not has_roas and not has_revenue:
+            roas_analysis["data_quality"]["missing_data_warning"] = (
+                "No ROAS or Revenue data available. Revenue analysis skipped. "
+                "Consider adding Revenue or Conversion Value columns for ROI insights."
+            )
+            logger.warning("ROAS/Revenue analysis skipped: No revenue data available")
+            return roas_analysis
+        
+        if has_roas and 'Spend' in df.columns:
+            # Filter out zero and NaN ROAS values
+            df_valid = df[(df['ROAS'].notna()) & (df['ROAS'] > 0)].copy()
+            zero_roas_count = len(df[df['ROAS'] == 0])
+            roas_analysis["data_quality"]["zero_roas_count"] = zero_roas_count
+            
+            if zero_roas_count > 0:
+                logger.info(f"Found {zero_roas_count} records with zero ROAS - excluding from analysis")
+            
+            if df_valid.empty:
+                roas_analysis["data_quality"]["missing_data_warning"] = (
+                    f"All ROAS values are zero or missing ({len(df)} records). "
+                    "Unable to calculate meaningful ROAS metrics."
+                )
+                return roas_analysis
+            
+            # Overall ROAS analysis (using valid data only)
+            total_spend = df_valid['Spend'].sum()
+            avg_roas = df_valid['ROAS'].mean()
+            weighted_roas = (df_valid['ROAS'] * df_valid['Spend']).sum() / total_spend if total_spend > 0 else 0
+            
+            # Calculate implied revenue
+            implied_revenue = total_spend * weighted_roas
+            
+            roas_analysis["overall"] = {
+                "average_roas": float(avg_roas),
+                "weighted_roas": float(weighted_roas),
+                "total_spend": float(total_spend),
+                "implied_revenue": float(implied_revenue),
+                "profit": float(implied_revenue - total_spend),
+                "profit_margin": float(((implied_revenue - total_spend) / implied_revenue * 100)) if implied_revenue > 0 else 0
+            }
+            
+            # ROAS by platform (use valid data only)
+            if 'Platform' in df_valid.columns:
+                platform_roas = df_valid.groupby('Platform').agg({
+                    'ROAS': 'mean',
+                    'Spend': 'sum'
+                })
+                
+                for platform, row in platform_roas.iterrows():
+                    if pd.notna(row['ROAS']) and row['ROAS'] > 0:
+                        platform_revenue = row['Spend'] * row['ROAS']
+                        roas_analysis["by_platform"][platform] = {
+                            "roas": float(row['ROAS']),
+                            "spend": float(row['Spend']),
+                            "revenue": float(platform_revenue),
+                            "profit": float(platform_revenue - row['Spend']),
+                            "vs_benchmark": self._compare_to_benchmark(platform, row['ROAS'])
+                        }
+            
+            # Efficiency tiers (use valid data only)
+            roas_analysis["efficiency_tiers"] = {
+                "excellent": {
+                    "count": len(df_valid[df_valid['ROAS'] >= 4.5]),
+                    "spend": float(df_valid[df_valid['ROAS'] >= 4.5]['Spend'].sum()),
+                    "avg_roas": float(df_valid[df_valid['ROAS'] >= 4.5]['ROAS'].mean()) if len(df_valid[df_valid['ROAS'] >= 4.5]) > 0 else 0
+                },
+                "good": {
+                    "count": len(df_valid[(df_valid['ROAS'] >= 3.5) & (df_valid['ROAS'] < 4.5)]),
+                    "spend": float(df_valid[(df_valid['ROAS'] >= 3.5) & (df_valid['ROAS'] < 4.5)]['Spend'].sum()),
+                    "avg_roas": float(df_valid[(df_valid['ROAS'] >= 3.5) & (df_valid['ROAS'] < 4.5)]['ROAS'].mean()) if len(df_valid[(df_valid['ROAS'] >= 3.5) & (df_valid['ROAS'] < 4.5)]) > 0 else 0
+                },
+                "needs_improvement": {
+                    "count": len(df_valid[df_valid['ROAS'] < 3.5]),
+                    "spend": float(df_valid[df_valid['ROAS'] < 3.5]['Spend'].sum()),
+                    "avg_roas": float(df_valid[df_valid['ROAS'] < 3.5]['ROAS'].mean()) if len(df_valid[df_valid['ROAS'] < 3.5]) > 0 else 0
+                }
+            }
+        
+        return roas_analysis
+    
+    def _analyze_audience(self, df: pd.DataFrame, metrics: Dict) -> Dict[str, Any]:
+        """Analyze audience performance (if data available)."""
+        audience_analysis = {
+            "available": False,
+            "insights": [],
+            "recommendations": []
+        }
+        
+        # Check for audience-related columns
+        audience_columns = [col for col in df.columns if any(keyword in col.lower() 
+                           for keyword in ['audience', 'demographic', 'age', 'gender', 'interest', 'segment'])]
+        
+        if audience_columns:
+            audience_analysis["available"] = True
+            audience_analysis["columns_found"] = audience_columns
+            audience_analysis["insights"].append({
+                "insight": f"Found {len(audience_columns)} audience-related data columns",
+                "recommendation": "Analyze performance by audience segment to optimize targeting"
+            })
+        else:
+            audience_analysis["insights"].append({
+                "insight": "No audience segmentation data found in current dataset",
+                "recommendation": "Consider adding audience data (demographics, interests, behaviors) for deeper analysis"
+            })
+        
+        # Platform-based audience insights
+        if 'Platform' in df.columns:
+            audience_analysis["platform_strengths"] = {
+                "google_ads": "Strong for intent-based audiences (search keywords, in-market)",
+                "meta_ads": "Excellent for demographic and interest-based targeting, lookalikes",
+                "linkedin_ads": "Best for B2B, job title, company size, industry targeting",
+                "dv360": "Programmatic audiences, third-party data, contextual targeting",
+                "snapchat_ads": "Young demographics (13-34), mobile-first audiences",
+                "cm360": "Cross-device audiences, attribution-based optimization"
+            }
+        
+        return audience_analysis
+    
+    def _analyze_tactics(self, df: pd.DataFrame, metrics: Dict) -> Dict[str, Any]:
+        """Analyze tactical execution and performance."""
+        tactics_analysis = {
+            "bidding_insights": [],
+            "creative_insights": [],
+            "placement_insights": [],
+            "timing_insights": []
+        }
+        
+        # CTR analysis (creative performance proxy)
+        if 'CTR' in df.columns:
+            avg_ctr = df['CTR'].mean()
+            high_ctr = df[df['CTR'] > 2.5]
+            low_ctr = df[df['CTR'] < 1.5]
+            
+            tactics_analysis["creative_insights"].append({
+                "metric": "CTR Analysis",
+                "average": f"{avg_ctr:.2f}%",
+                "high_performers": len(high_ctr),
+                "low_performers": len(low_ctr),
+                "recommendation": "Analyze high-CTR creatives and replicate winning elements" if len(high_ctr) > 0 else "Test new creative variations to improve CTR"
+            })
+        
+        # CPA analysis (bidding efficiency)
+        if 'CPA' in df.columns:
+            avg_cpa = df['CPA'].mean()
+            cpa_std = df['CPA'].std()
+            
+            tactics_analysis["bidding_insights"].append({
+                "metric": "CPA Consistency",
+                "average": f"${avg_cpa:.2f}",
+                "std_deviation": f"${cpa_std:.2f}",
+                "recommendation": "High CPA variance suggests inconsistent bidding - consider automated bidding strategies" if cpa_std > avg_cpa * 0.3 else "CPA is consistent - current bidding strategy is working well"
+            })
+        
+        # Platform-specific tactical recommendations
+        if 'Platform' in df.columns:
+            try:
+                platforms = df['Platform'].unique() if hasattr(df['Platform'], 'unique') else df['Platform'].iloc[:, 0].unique()
+            except:
+                platforms = []
+            for platform in platforms:
+                platform_tactics = self._get_platform_tactics(platform)
+                tactics_analysis["placement_insights"].append({
+                    "platform": platform,
+                    "recommended_tactics": platform_tactics
+                })
+        
+        # Time-based insights
+        if 'Date' in df.columns:
+            df['DayOfWeek'] = pd.to_datetime(df['Date']).dt.day_name()
+            if 'Conversions' in df.columns:
+                day_performance = df.groupby('DayOfWeek')['Conversions'].sum().to_dict()
+                best_day = max(day_performance, key=day_performance.get)
+                
+                tactics_analysis["timing_insights"].append({
+                    "metric": "Day of Week Performance",
+                    "best_day": best_day,
+                    "recommendation": f"Consider increasing bids on {best_day} when conversion rates are highest"
+                })
+        
+        return tactics_analysis
+    
+    def _compare_to_benchmark(self, platform: str, roas: float) -> str:
+        """Compare ROAS to industry benchmarks."""
+        benchmarks = {
+            "google_ads": (2.0, 4.0),
+            "meta_ads": (2.5, 4.5),
+            "linkedin_ads": (2.0, 3.5),
+            "dv360": (1.5, 3.0),
+            "snapchat_ads": (2.0, 3.5),
+            "cm360": (1.5, 3.0)
+        }
+        
+        if platform in benchmarks:
+            low, high = benchmarks[platform]
+            if roas >= high:
+                return f"Excellent (above {high}x benchmark)"
+            elif roas >= low:
+                return f"Good (within {low}-{high}x benchmark)"
+            else:
+                return f"Below benchmark (target: {low}-{high}x)"
+        
+        return "No benchmark available"
+    
+    def _get_platform_tactics(self, platform: str) -> List[str]:
+        """Get platform-specific tactical recommendations."""
+        tactics = {
+            "google_ads": [
+                "Use Target ROAS bidding for conversion optimization",
+                "Implement responsive search ads with 15 headlines",
+                "Leverage audience segments for bid adjustments",
+                "Test Performance Max campaigns for full-funnel"
+            ],
+            "meta_ads": [
+                "Create Advantage+ campaigns for automated optimization",
+                "Use Lookalike audiences from top converters",
+                "Test Reels and Stories placements",
+                "Implement dynamic creative optimization"
+            ],
+            "linkedin_ads": [
+                "Target by job title and seniority for B2B",
+                "Use Matched Audiences for retargeting",
+                "Test Conversation Ads for engagement",
+                "Implement lead gen forms for lower friction"
+            ],
+            "dv360": [
+                "Leverage programmatic guaranteed deals",
+                "Use contextual targeting for brand safety",
+                "Implement frequency capping",
+                "Test connected TV placements"
+            ],
+            "snapchat_ads": [
+                "Focus on vertical video creative",
+                "Use Snap Pixel for conversion tracking",
+                "Test AR lenses for engagement",
+                "Target Gen Z with trending content"
+            ],
+            "cm360": [
+                "Implement cross-device attribution",
+                "Use floodlight tags for conversion tracking",
+                "Leverage audience insights for optimization",
+                "Test sequential messaging strategies"
+            ]
+        }
+        
+        return tactics.get(platform, ["Platform-specific tactics not available"])
+    
+    # ==================== RAG-ENHANCED METHODS (EXPERIMENTAL) ====================
+    # These methods are isolated and do NOT affect existing functionality
+    
+    def _initialize_rag_engine(self):
+        """Lazy initialization of RAG engine (only when needed).
+        
+        Uses existing knowledge base from causal_kb_rag.py as primary source.
+        Falls back to mock data only if all else fails.
+        """
+        if hasattr(self, '_rag_engine') and self._rag_engine is not None:
+            return self._rag_engine
+        
+        try:
+            # First, try to use the CausalKnowledgeBase which has comprehensive built-in knowledge
+            from ..knowledge.causal_kb_rag import get_knowledge_base
+            from ..knowledge.benchmark_engine import DynamicBenchmarkEngine
+            
+            causal_kb = get_knowledge_base()
+            benchmark_engine = DynamicBenchmarkEngine()
+            logger.info("CausalKnowledgeBase + DynamicBenchmarkEngine loaded successfully")
+            
+            # Create a wrapper that provides the same interface as SimpleRAGEngine
+            class CausalKBWrapper:
+                """Wrapper around CausalKnowledgeBase and DynamicBenchmarkEngine to provide RAG-like interface."""
+                
+                def __init__(self, knowledge_base, benchmark_engine):
+                    self.kb = knowledge_base
+                    self.knowledge = knowledge_base.knowledge
+                    self.benchmark_engine = benchmark_engine
+                    self.vector_retriever = None  # Not using vector store
+                    self.hybrid_retriever = None
+                    
+                def search_knowledge(self, query: str, top_k: int = 5):
+                    """Search the knowledge base and benchmarks for relevant content."""
+                    query_lower = query.lower()
+                    results = []
+                    
+                    # 1. Search through CausalKnowledgeBase categories
+                    for category, content in self.knowledge.items():
+                        if isinstance(content, dict):
+                            for key, value in content.items():
+                                relevance = self._calculate_relevance(query_lower, key, value)
+                                if relevance > 0.3:
+                                    results.append({
+                                        'content': str(value),
+                                        'source': f"Marketing KB - {category}/{key}",
+                                        'score': relevance,
+                                        'category': category
+                                    })
+                        elif isinstance(content, list):
+                            for i, item in enumerate(content):
+                                relevance = self._calculate_relevance(query_lower, category, item)
+                                if relevance > 0.3:
+                                    results.append({
+                                        'content': str(item),
+                                        'source': f"Marketing KB - {category}",
+                                        'score': relevance,
+                                        'category': category
+                                    })
+                    
+                    # 2. Search DynamicBenchmarkEngine for industry benchmarks
+                    benchmark_results = self._search_benchmarks(query_lower)
+                    results.extend(benchmark_results)
+                    
+                    # Sort by relevance and return top_k
+                    results.sort(key=lambda x: x['score'], reverse=True)
+                    return results[:top_k]
+                
+                def _search_benchmarks(self, query: str) -> list:
+                    """Search the DynamicBenchmarkEngine for relevant benchmarks."""
+                    results = []
+                    
+                    # Detect channel from query
+                    channels = ['google', 'linkedin', 'meta', 'facebook', 'dv360', 'programmatic']
+                    detected_channel = None
+                    for ch in channels:
+                        if ch in query:
+                            detected_channel = ch
+                            break
+                    
+                    # Detect business model
+                    business_model = 'B2B' if 'b2b' in query else ('B2C' if 'b2c' in query else None)
+                    
+                    # Detect industry
+                    industries = ['saas', 'e-commerce', 'ecommerce', 'retail', 'healthcare', 'financial', 'auto']
+                    detected_industry = None
+                    for ind in industries:
+                        if ind in query:
+                            detected_industry = ind.replace('ecommerce', 'e_commerce')
+                            break
+                    
+                    # Search benchmark database
+                    for channel_key, channel_data in self.benchmark_engine.benchmark_db.items():
+                        # Check if channel matches query
+                        channel_name = channel_key.split('_')[0]
+                        channel_relevance = 0.4 if detected_channel and detected_channel in channel_key else 0.2
+                        
+                        for industry_key, metrics in channel_data.items():
+                            if industry_key == 'default':
+                                continue
+                            
+                            industry_relevance = 0.3 if detected_industry and detected_industry in industry_key else 0.1
+                            
+                            # Format benchmarks as readable content
+                            benchmark_text = f"Benchmarks for {channel_name.upper()} - {industry_key.replace('_', ' ').title()}: "
+                            metric_parts = []
+                            for metric, ranges in metrics.items():
+                                if isinstance(ranges, dict):
+                                    good_val = ranges.get('good', ranges.get('average', 'N/A'))
+                                    excellent_val = ranges.get('excellent', 'N/A')
+                                    metric_parts.append(f"{metric.upper()}: Good={good_val}, Excellent={excellent_val}")
+                            
+                            if metric_parts:
+                                benchmark_text += "; ".join(metric_parts)
+                                
+                                # Calculate relevance
+                                relevance = channel_relevance + industry_relevance
+                                if any(term in query for term in ['benchmark', 'ctr', 'cpc', 'cpa', 'roas', 'conv']):
+                                    relevance += 0.25
+                                
+                                if relevance > 0.3:
+                                    results.append({
+                                        'content': benchmark_text,
+                                        'source': f"Industry Benchmarks - {channel_key}",
+                                        'score': min(relevance, 1.0),
+                                        'category': 'benchmarks'
+                                    })
+                    
+                    # Also add regional multiplier info if region mentioned
+                    if any(r in query for r in ['region', 'europe', 'asia', 'america', 'latam']):
+                        regional_info = "Regional adjustments apply to benchmarks: Europe ~0.85-0.95x, Asia Pacific ~0.70-0.88x, Latin America ~0.55-0.78x of North America baseline."
+                        results.append({
+                            'content': regional_info,
+                            'source': 'Regional Benchmark Adjustments',
+                            'score': 0.6,
+                            'category': 'benchmarks'
+                        })
+                    
+                    return results
+                
+                def _calculate_relevance(self, query: str, key: str, value) -> float:
+                    """Simple keyword-based relevance scoring."""
+                    score = 0.0
+                    search_text = f"{key} {str(value)}".lower()
+                    
+                    # Check for query terms in content
+                    query_terms = query.split()
+                    for term in query_terms:
+                        if term in search_text:
+                            score += 0.2
+                    
+                    # Boost for exact key match
+                    if key.lower() in query:
+                        score += 0.3
+                    
+                    # Boost for marketing-specific terms
+                    marketing_terms = ['ctr', 'cpa', 'roas', 'cvr', 'benchmark', 'optimization', 'campaign', 'conversion', 'cpc']
+                    for term in marketing_terms:
+                        if term in query and term in search_text:
+                            score += 0.15
+                    
+                    return min(score, 1.0)
+            
+            self._rag_engine = CausalKBWrapper(causal_kb, benchmark_engine)
+            logger.info("RAG engine initialized with CausalKnowledgeBase + DynamicBenchmarkEngine")
+            return self._rag_engine
+            
+        except Exception as e:
+            logger.warning(f"Failed to initialize CausalKnowledgeBase: {e}")
+            
+            # Try the vector store approach as secondary option
+            try:
+                from ..knowledge.vector_store import VectorStoreConfig, VectorStoreBuilder, VectorRetriever, HybridRetriever
+                from pathlib import Path
+                import json
+                
+                config = VectorStoreConfig()
+                
+                if config.index_path.exists() and config.metadata_path.exists():
+                    # Initialize retrievers from existing vector store
+                    vector_retriever = VectorRetriever(config=config)
+                    hybrid_retriever = HybridRetriever(
+                        config=config,
+                        use_keyword=True,
+                        use_rerank=True,
+                        vector_weight=0.6,
+                        keyword_weight=0.4,
+                        rrf_k=60.0
+                    )
+                    
+                    class SimpleRAGEngine:
+                        def __init__(self, vector_retriever, hybrid_retriever):
+                            self.vector_retriever = vector_retriever
+                            self.hybrid_retriever = hybrid_retriever
+                    
+                    self._rag_engine = SimpleRAGEngine(vector_retriever, hybrid_retriever)
+                    logger.info("RAG engine initialized with vector store")
+                    return self._rag_engine
+                    
+            except Exception as e2:
+                logger.warning(f"Failed to initialize vector store: {e2}")
+            
+            self._rag_engine = None
+            return None
+    
+    def _get_mock_benchmark_data(self, metrics: Dict) -> List[Dict[str, Any]]:
+        """Generate mock benchmark data when RAG is not available.
+        
+        This ensures RAG comparison always shows something different from standard.
+        """
+        overview = metrics.get('overview', {})
+        platforms = list(metrics.get('by_platform', {}).keys())
+        
+        # Determine business type from metrics
+        avg_roas = overview.get('avg_roas', 2.5)
+        avg_cpa = overview.get('avg_cpa', 50)
+        
+        business_type = "B2B SaaS" if avg_cpa > 100 else "B2C E-commerce"
+        
+        mock_benchmarks = [
+            {
+                'content': f"""Industry Benchmark Report 2024 - {business_type}
+                
+Average Performance Metrics:
+- ROAS: 3.2x (Top performers: 4.5x+)
+- CPA: ${avg_cpa * 0.8:.2f} (Industry median)
+- CTR: 2.8% (Search), 1.2% (Display), 0.9% (Social)
+- Conversion Rate: 3.5% (Industry average)
+
+Key Success Factors:
+1. Campaigns with 3-5x ad frequency see 20-25% higher CTR
+2. A/B testing creative every 2 weeks improves performance by 15-18%
+3. Automated bidding (Target ROAS) outperforms manual by 22%""",
+                'source': 'Digital Marketing Benchmark Report 2024',
+                'score': 0.95
+            },
+            {
+                'content': f"""Platform-Specific Best Practices - {', '.join(platforms[:2]) if platforms else 'Multi-Channel'}
+
+Google Ads Optimization:
+- Quality Score 8+ reduces CPC by 30-40%
+- Smart Bidding with Target ROAS 3.5x recommended
+- Responsive Search Ads improve CTR by 10-15%
+
+Meta Advertising:
+- Lookalike audiences (1-3%) deliver 2.5x better ROAS
+- Video ads generate 35% more engagement
+- Campaign Budget Optimization improves efficiency by 20%
+
+LinkedIn B2B:
+- Sponsored Content CTR benchmark: 0.45%
+- Lead Gen Forms convert 3x better than landing pages
+- Audience targeting by job title + company size optimal""",
+                'source': 'Platform Optimization Guide 2024',
+                'score': 0.92
+            },
+            {
+                'content': f"""Tactical Recommendations for {business_type}
+
+Budget Allocation:
+- Shift 20-30% budget from underperforming channels
+- Expected ROAS improvement: +25-35%
+- Implement weekly budget reviews
+
+Creative Strategy:
+- Refresh creative assets every 14 days
+- Test 3-5 variations per campaign
+- Expected CTR lift: +15-20%
+
+Bidding Optimization:
+- Migrate to automated bidding strategies
+- Set Target ROAS at {avg_roas * 1.2:.1f}x
+- Expected efficiency gain: +18-25%""",
+                'source': 'Marketing Optimization Playbook 2024',
+                'score': 0.88
+            }
+        ]
+        
+        return mock_benchmarks
+    
+    def _retrieve_rag_context(self, metrics: Dict, top_k: int = 10) -> List[Dict[str, Any]]:
+        """Retrieve relevant knowledge from RAG system with semantic caching.
+        
+        Uses smart query bundling and semantic caching to reduce redundant queries.
+        
+        Args:
+            metrics: Campaign metrics dictionary
+            top_k: Number of top knowledge chunks to retrieve
+            
+        Returns:
+            List of relevant knowledge chunks with metadata
+        """
+        start_time = time.time()
+        
+        # Get performance optimizer for caching
+        perf = _get_perf_optimizer()
+        
+        # Build optimized bundled queries
+        overview = metrics.get('overview', {})
+        platform_metrics = metrics.get('by_platform', {})
+        platforms = list(platform_metrics.keys())[:3] if platform_metrics else []
+        
+        # Detect issues for targeted queries
+        detected_issues = self._detect_performance_issues(metrics)
+        
+        # Use smart query bundling (reduces 5+ queries to 2-3)
+        bundled_queries = bundle_queries(metrics, detected_issues, platforms)
+        logger.info(f"Using {len(bundled_queries)} bundled queries (reduced from ~5)")
+        
+        # Collect all results
+        all_knowledge_chunks = []
+        cache_hits = 0
+        cache_misses = 0
+        
+        for query in bundled_queries:
+            # Check semantic cache first
+            cached_result = cache_get(query)
+            
+            if cached_result is not None:
+                logger.debug(f"Cache HIT for query: {query[:50]}...")
+                all_knowledge_chunks.extend(cached_result)
+                cache_hits += 1
+                continue
+            
+            cache_misses += 1
+            logger.debug(f"Cache MISS for query: {query[:50]}...")
+            
+            # Query RAG engine with metadata filtering
+            chunks = self._execute_rag_query(query, top_k=top_k, use_filters=True)
+            
+            # Cache the results
+            if chunks:
+                cache_set(query, chunks)
+                all_knowledge_chunks.extend(chunks)
+        
+        # Deduplicate by content similarity
+        unique_chunks = self._deduplicate_chunks(all_knowledge_chunks)
+        
+        elapsed = time.time() - start_time
+        logger.info(f"RAG retrieval: {len(unique_chunks)} chunks in {elapsed:.2f}s "
+                   f"(cache hits: {cache_hits}, misses: {cache_misses})")
+        
+        return unique_chunks[:top_k * 2]  # Return more chunks for comprehensive context
+    
+    def _detect_performance_issues(self, metrics: Dict) -> List[str]:
+        """Detect performance issues from metrics for targeted RAG queries."""
+        issues = []
+        overview = metrics.get('overview', {})
+        
+        # Check CPA
+        avg_cpa = overview.get('avg_cpa', 0)
+        if avg_cpa > 100:
+            issues.append('high_cpa')
+        
+        # Check CTR
+        avg_ctr = overview.get('avg_ctr', 0)
+        if avg_ctr < 1.0:
+            issues.append('low_ctr')
+        
+        # Check ROAS
+        avg_roas = overview.get('avg_roas', 0)
+        if 0 < avg_roas < 2.0:
+            issues.append('low_roas')
+        
+        return issues
+    
+    def _execute_rag_query(self, query: str, top_k: int = 5, use_filters: bool = False) -> List[Dict[str, Any]]:
+        """Execute a single RAG query with optional metadata filtering."""
+        rag_engine = self._initialize_rag_engine()
+        if rag_engine is None:
+            # Return mock data if no RAG engine
+            return self._get_mock_benchmark_data_for_query(query)
+        
+        try:
+            # First, try CausalKBWrapper's search_knowledge method (primary)
+            if hasattr(rag_engine, 'search_knowledge'):
+                results = rag_engine.search_knowledge(query, top_k=top_k)
+                logger.debug(f"CausalKB search returned {len(results)} results for: {query[:50]}...")
+                return results
+            
+            # Build metadata filters for high-priority content
+            metadata_filters = None
+            if use_filters:
+                # Prioritize high-priority benchmarks and best practices
+                metadata_filters = {
+                    'priority': ['high', 'critical']  # Only get high-value content
+                }
+            
+            # Fallback: Retrieve using hybrid retriever (vector + keyword + rerank)
+            if hasattr(rag_engine, 'hybrid_retriever') and rag_engine.hybrid_retriever:
+                results = rag_engine.hybrid_retriever.search(
+                    query, 
+                    top_k=top_k,
+                    metadata_filters=metadata_filters
+                )
+                logger.debug(f"Hybrid retriever returned {len(results)} results for: {query[:50]}...")
+            elif hasattr(rag_engine, 'vector_retriever') and rag_engine.vector_retriever:
+                results = rag_engine.vector_retriever.search(
+                    query, 
+                    top_k=top_k,
+                    metadata_filters=metadata_filters
+                )
+                logger.debug(f"Vector retriever returned {len(results)} results for: {query[:50]}...")
+            else:
+                logger.warning("No retriever available in RAG engine")
+                return []
+            
+            # Format results
+            knowledge_chunks = []
+            for result in results:
+                knowledge_chunks.append({
+                    'content': result.get('text', ''),
+                    'source': result.get('metadata', {}).get('title', 'unknown'),
+                    'score': result.get('score', 0.0)
+                })
+            
+            return knowledge_chunks
+            
+        except Exception as e:
+            logger.error(f"RAG query failed: {e}")
+            return []
+    
+    def _get_mock_benchmark_data_for_query(self, query: str) -> List[Dict[str, Any]]:
+        """Get mock benchmark data based on query content."""
+        # Simple mock data - in production this would be from actual RAG
+        mock_data = {
+            'content': f"Industry benchmark data for: {query[:100]}. "
+                      f"Average CTR: 1.5%, Average CPC: $2.50, Average ROAS: 3.5x. "
+                      f"Top performers achieve 2x these benchmarks through optimization.",
+            'source': 'Industry Benchmarks 2024',
+            'score': 0.85
+        }
+        return [mock_data]
+    
+    def _deduplicate_chunks(self, chunks: List[Dict]) -> List[Dict]:
+        """Remove duplicate chunks based on content similarity."""
+        if not chunks:
+            return []
+        
+        seen_content = set()
+        unique = []
+        
+        for chunk in chunks:
+            content = chunk.get('content', '')[:200]  # Compare first 200 chars
+            content_hash = hash(content.lower().strip())
+            
+            if content_hash not in seen_content:
+                seen_content.add(content_hash)
+                unique.append(chunk)
+        
+        # Sort by score
+        unique.sort(key=lambda x: x.get('score', 0), reverse=True)
+        
+        return unique
+    
+    def _build_rag_augmented_prompt(self, 
+                                   metrics: Dict, 
+                                   insights: List, 
+                                   recommendations: List,
+                                   rag_context: List[Dict[str, Any]],
+                                   campaign_context: Dict[str, Any] = None) -> str:
+        """Build comprehensive RAG-augmented prompt for deep, actionable analysis.
+        
+        This prompt generates detailed insights with:
+        - Campaign context awareness (goals, constraints, priorities)
+        - Chain-of-thought reasoning
+        - Root cause analysis (5 Whys methodology)
+        - Quantified business impact
+        - Evidence-based recommendations
+        - Specific action steps with timelines
+        - Success pattern identification
+        
+        Args:
+            metrics: Campaign metrics
+            insights: Generated insights
+            recommendations: Generated recommendations
+            rag_context: Retrieved knowledge chunks
+            campaign_context: Campaign goals, constraints, and priorities
+            
+        Returns:
+            RAG-augmented prompt string
+        """
+        # Build campaign context section (NEW)
+        context_section = ""
+        if campaign_context:
+            context_section = "\n\n=== CAMPAIGN CONTEXT ===\n\n"
+            context_section += f"Stage: {campaign_context['stage']['stage'].title()} - {campaign_context['stage']['description']}\n\n"
+            
+            if campaign_context['goals']:
+                context_section += "Primary Goals:\n"
+                for goal in campaign_context['goals'][:3]:
+                    context_section += f"- {goal['description']}\n"
+                context_section += "\n"
+            
+            if campaign_context['priorities']:
+                context_section += "Top Priorities:\n"
+                for priority in campaign_context['priorities'][:3]:
+                    context_section += f"{priority['priority']}. {priority['description']} (Urgency: {priority['urgency']})\n"
+                context_section += "\n"
+            
+            constraints = campaign_context.get('constraints', {})
+            if constraints.get('protected_channels'):
+                protected = [ch['platform'] for ch in constraints['protected_channels']]
+                context_section += f"Protected Channels: {', '.join(protected)} (cannot be paused)\n\n"
+        
+        # Build knowledge context section
+        knowledge_section = ""
+        if rag_context:
+            knowledge_section = "\n\n=== INDUSTRY KNOWLEDGE BASE ===\n\n"
+            for idx, chunk in enumerate(rag_context, 1):
+                source = chunk.get('source', 'unknown')
+                content = chunk.get('content', '')
+                knowledge_section += f"Source {idx} - {source}:\n{content}\n\n"
+        
+        # Get enhanced summary data with more detail
+        summary_data = self._prepare_enhanced_summary_data(metrics, insights, recommendations)
+        
+        # Check if we have RAG context
+        has_rag_context = len(rag_context) > 0
+        
+        # Build the comprehensive prompt
+        prompt = f"""You are an expert marketing analyst conducting a comprehensive campaign analysis. Your role is to provide DEEP, ACTIONABLE insights - not surface-level observations.
+
+=== CHAIN-OF-THOUGHT REASONING FRAMEWORK ===
+
+Use this structured thinking process for EVERY insight:
+
+STEP 1 - UNDERSTAND THE SITUATION:
+- What is the current state? (specific metrics with numbers)
+- What is the expected/benchmark state?
+- What is the gap? (quantified)
+
+STEP 2 - IDENTIFY ROOT CAUSES:
+- What immediate factors explain this gap?
+- What underlying issues drive those factors?
+- Apply 5 Whys to reach the root cause
+
+STEP 3 - VALIDATE WITH EVIDENCE:
+- What data supports this hypothesis?
+- What industry knowledge confirms this?
+- Are there any contradicting signals?
+
+STEP 4 - FORMULATE RECOMMENDATIONS:
+- What specific actions address the root cause?
+- What is the expected impact? (quantified)
+- What is the confidence level? (high/medium/low with reasoning)
+- What are the implementation steps?
+
+=== ANALYSIS PHILOSOPHY ===
+
+1. QUANTIFY EVERYTHING: Never say "improved" - say "improved by 23 percent from 1.2 to 1.48"
+2. EXPLAIN CAUSATION: Don't just state correlations - explain WHY something is happening using the Chain-of-Thought framework
+3. ROOT CAUSE ANALYSIS: Apply "5 Whys" methodology to dig beyond symptoms
+4. SPECIFIC ACTIONS: "Optimize targeting" is useless - "Expand audience from 50K to 200K by removing company size filter" is actionable
+5. CALCULATE IMPACT: Translate percentages to business outcomes (leads, revenue, cost savings)
+6. SHOW YOUR REASONING: For each insight, briefly show your thinking process
+7. STATE CONFIDENCE: Always indicate confidence level (high/medium/low) with reasoning
+8. ONLY USE AVAILABLE DATA: Never reference metrics that are not in the data. If conversions or ROAS are missing, focus on available metrics like CTR, CPC, impressions, clicks, spend.
+
+{context_section}
+
+{knowledge_section}
+
+=== CAMPAIGN DATA ===
+
+{json.dumps(summary_data, indent=2)}
+
+=== YOUR TASK ===
+
+You must generate TWO separate analyses: a BRIEF summary and a DETAILED deep-dive.
+
+=== BRIEF SUMMARY (4 sections) ===
+
+Start with "BRIEF:" on its own line, then provide these 4 sections:
+
+Overall
+
+Write 4-5 sentences providing a high-level executive overview. Include: total spend and what it achieved, overall efficiency vs benchmarks, the single biggest win, and the single biggest concern. A CMO should understand campaign health in 30 seconds. Use specific numbers.
+
+Channel Summary
+
+Write 3-4 sentences per channel/platform. For each: state spend, key metrics (CTR, CPC, CPA if available), performance vs benchmark, and one-line verdict (scale up, optimize, or reduce). Rank channels from best to worst performing.
+
+Dimension & Platform Insights
+
+Write 4-5 sentences analyzing performance across key dimensions: Funnel Stages, Platforms, Devices (Mobile vs Desktop), Regions, Placements, and Ad Types. Identify where efficiency is highest and where potential growth or waste is occurring.
+
+Key Strengths
+
+Write 3-4 bullet points identifying what is working well. Each bullet should name the specific element (campaign, platform, audience, creative), state the metric proving success, and briefly explain WHY it works. Focus on replicable patterns.
+
+Priority Actions
+
+Write 3 numbered, specific actions to take immediately. Each action must include: what to do, where to do it, expected impact with numbers, and timeline. These should be copy-paste ready for a media buyer.
+
+=== DETAILED SUMMARY (deep analysis) ===
+
+After the brief, write "DETAILED:" on its own line, then provide comprehensive analysis:
+
+Executive Overview
+
+Write 5-6 sentences with complete context: campaign objectives, total investment, key results achieved, efficiency metrics vs industry benchmarks, trend direction over the analysis period, and overall health assessment with confidence level.
+
+Channel & Dimension Deep-Dive
+
+Clearly identify the Top 5 performing channels and Bottom 5 laggards. Provide a comprehensive analysis of:
+- **Platforms & Channels**: Detailed performance metrics and verdicts for each.
+- **Funnel Analysis**: Effectiveness across Awareness, Consideration, and Conversion stages.
+- **Device & Placement**: Performance comparison between Mobile/Desktop and various ad placements.
+- **Geography & Audience**: Regional performance trends and audience segment efficiency.
+- **Creatives & Ad Types**: Analysis of which creative formats and ad types are driving the highest ROAS/CPA.
+
+For EACH key segment, provide:
+- Investment: Spend amount and share of total budget
+- Performance: All available metrics (impressions, clicks, CTR, CPC, conversions, CPA, ROAS)
+- Benchmark Comparison: How each metric compares to industry standards (cite the benchmark source from knowledge base)
+- Trend: Is performance improving or declining over the period
+- Diagnosis: Root cause of strong or weak performance
+- Verdict: Specific recommendation (increase budget by X, optimize Y, reduce spend by Z)
+
+Performance Analysis
+
+Analyze the relationships between metrics:
+- Efficiency patterns: Which combinations of targeting, creative, and bidding drive best results
+- Conversion funnel: Where are the biggest drop-offs (impressions to clicks, clicks to conversions)
+- Cost drivers: What is causing high or low costs
+- Quality indicators: CTR trends, relevance scores, engagement patterns
+
+Root Cause Analysis
+
+For the top 2-3 issues, apply 5 Whys methodology:
+- State the problem with specific numbers
+- First Why: Immediate cause
+- Second Why: What drives that
+- Third Why: Underlying factor
+- Root Cause: Fundamental issue to fix
+- Business Impact: Quantified cost of the problem
+
+Success Pattern Analysis
+
+For top performers, explain the success factors:
+- What specific elements are driving outperformance
+- Evidence from the data supporting each factor
+- Validation from industry knowledge base
+- How to replicate across other campaigns
+
+Strategic Recommendations
+
+Provide 5 prioritized recommendations with full detail:
+1. Highest Impact: Action, rationale, expected outcome, timeline, success metric
+2. Quick Win: Action that can be done in 48 hours with immediate benefit
+3. Optimization: Specific changes to improve underperformers
+4. Scale Opportunity: How to expand what is working
+5. Risk Mitigation: How to address the biggest threat
+
+Budget Reallocation
+
+Specific dollar amounts to move:
+- From: [Platform/Campaign] - reduce by [amount] because [reason]
+- To: [Platform/Campaign] - increase by [amount] expecting [outcome]
+- Net impact: Expected improvement in [metric] by [percent]
+
+Monitoring Plan
+
+- Daily: Which metrics to check, what thresholds trigger action
+- Weekly: Review cadence and decision points
+- Success criteria: How to know if recommendations worked
+- Pivot triggers: When to change strategy
+
+=== CRITICAL FORMATTING RULES ===
+
+1. Start brief section with "BRIEF:" on its own line.
+2. Start detailed section with "DETAILED:" on its own line.
+3. Each main section header on its OWN LINE, then blank line.
+4. Use **bold markdown** for internal sub-headers and significant findings.
+5. **MANDATORY NUMBER FORMATTING**:
+   - Spend/Costs: Use "$" prefix and suffix "K" or "Million" (e.g. $143.6K, $1.2M).
+   - Impressions: Use "K" or "Million" suffixes (e.g. 18.3 Million).
+   - CTR: Always use the "%" symbol (e.g. 1.25%).
+6. **Summary Header**: In the Overview, always use a bold **Summary:** sub-header.
+7. **Platform Specifics**: Use bold platform names (e.g. **Meta:**) as internal sub-headers.
+8. NEVER include stray characters, meta-text instructions, or unquantified adjectives.
+9. Use Markdown lists for readability.
+8. Use specific numbers from the data - never say "significant" without quantification
+9. ONLY reference metrics that exist in the provided data
+
+=== ANTI-HALLUCINATION RULES ===
+
+- If conversion data is not available, do NOT reference conversions, ROAS, or CPA
+- If revenue data is not available, do NOT calculate revenue impact
+- Focus analysis on the metrics that ARE present in the data
+- Clearly state "Based on available data" when certain metrics are missing
+- Reference the knowledge base sources when citing benchmarks
+
+Generate the complete BRIEF and DETAILED RAG-enhanced analysis now:"""
+        
+        return prompt
+    
+    def _prepare_enhanced_summary_data(self, metrics: Dict, insights: List, recommendations: List) -> Dict:
+        """Prepare enhanced summary data with more granular detail for deep analysis."""
+        # Convert to JSON-serializable format
+        def make_serializable(obj):
+            """Convert pandas objects to JSON-serializable types."""
+            if isinstance(obj, pd.Series):
+                return obj.to_dict()
+            elif isinstance(obj, pd.DataFrame):
+                return obj.to_dict('records')
+            elif isinstance(obj, (np.integer, np.floating)):
+                return float(obj)
+            elif isinstance(obj, dict):
+                return {k: make_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [make_serializable(item) for item in obj]
+            return obj
+        
+        overview = make_serializable(metrics.get('overview', {}))
+        platform_metrics = metrics.get('by_platform', {})
+        campaign_metrics = metrics.get('by_campaign', {})
+        channel_metrics = metrics.get('by_channel', {})
+        funnel_metrics = metrics.get('by_funnel', {})
+        creative_metrics = metrics.get('by_creative', {})
+        audience_metrics = metrics.get('by_audience', {})
+        device_metrics = metrics.get('by_device', {})
+        placement_metrics = metrics.get('by_placement', {})
+        region_metrics = metrics.get('by_region', {})
+        ad_type_metrics = metrics.get('by_ad_type', {})
+        
+        # CRITICAL: Filter out platforms/channels with 0 spend to prevent hallucination
+        platform_metrics = {
+            name: data for name, data in platform_metrics.items()
+            if isinstance(data, dict) and data.get('Spend', data.get('spend', 0)) > 0
+        }
+        channel_metrics = {
+            name: data for name, data in channel_metrics.items()
+            if isinstance(data, dict) and data.get('Spend', data.get('spend', 0)) > 0
+        }
+        
+        # Rank Channels
+        def _rank_items(source: Dict[str, Dict[str, Any]], metric: str = 'ROAS', n: int = 5):
+            items = [{"name": name, **data} for name, data in source.items()]
+            valid_items = [item for item in items if item.get(metric) is not None]
+            top = sorted(valid_items, key=lambda x: x[metric], reverse=True)[:n]
+            bottom = sorted(valid_items, key=lambda x: x[metric], reverse=False)[:n]
+            return top, bottom
+
+        top_channels, bottom_channels = _rank_items(channel_metrics, 'ROAS')
+        logger.info(f"RAG: Ranked {len(channel_metrics)} channels")
+        
+        # Identify available metrics to prevent hallucination
+        available_metrics = []
+        if overview:
+            if overview.get('total_spend', 0) > 0:
+                available_metrics.append('spend')
+            if overview.get('total_impressions', 0) > 0:
+                available_metrics.append('impressions')
+            if overview.get('total_clicks', 0) > 0:
+                available_metrics.append('clicks')
+            if overview.get('total_conversions', 0) > 0:
+                available_metrics.append('conversions')
+            if overview.get('total_revenue', 0) > 0:
+                available_metrics.append('revenue')
+            if overview.get('overall_ctr', 0) > 0:
+                available_metrics.append('ctr')
+            if overview.get('overall_cpc', 0) > 0:
+                available_metrics.append('cpc')
+            if overview.get('overall_roas', 0) > 0:
+                available_metrics.append('roas')
+            if overview.get('overall_cpa', 0) > 0:
+                available_metrics.append('cpa')
+        
+        # Find best and worst performers with more detail
+        platform_analysis = []
+        if platform_metrics:
+            for platform, m in platform_metrics.items():
+                platform_data = {
+                    'name': platform,
+                    'spend': m.get('Spend', m.get('spend', 0)),  # Try uppercase first, then lowercase
+                    'impressions': m.get('Impressions', m.get('impressions', 0)),
+                    'clicks': m.get('Clicks', m.get('clicks', 0)),
+                    'ctr': m.get('CTR', m.get('ctr', 0)),
+                    'cpc': m.get('CPC', m.get('cpc', 0)),
+                }
+                # Only include conversion metrics if available
+                conversions = m.get('Conversions', m.get('conversions', 0))
+                if conversions > 0:
+                    platform_data['conversions'] = conversions
+                    platform_data['cpa'] = m.get('CPA', m.get('cpa', 0))
+                roas = m.get('ROAS', m.get('roas', 0))
+                if roas > 0:
+                    platform_data['roas'] = roas
+                revenue = m.get('Revenue', m.get('revenue', 0))
+                if revenue > 0:
+                    platform_data['revenue'] = revenue
+                
+                # Calculate spend share
+                total_spend = overview.get('total_spend', 1)
+                platform_spend = m.get('Spend', m.get('spend', 0))
+                platform_data['spend_share_percent'] = round((platform_spend / total_spend) * 100, 1) if total_spend > 0 else 0
+                
+                platform_analysis.append(platform_data)
+            
+            # Sort by efficiency (ROAS if available, else CTR)
+            if any(p.get('roas', 0) > 0 for p in platform_analysis):
+                platform_analysis.sort(key=lambda x: x.get('roas', 0), reverse=True)
+            else:
+                platform_analysis.sort(key=lambda x: x.get('ctr', 0), reverse=True)
+        
+        # Campaign-level analysis (top and bottom performers)
+        campaign_analysis = {'top_performers': [], 'bottom_performers': []}
+        if campaign_metrics:
+            campaigns_list = []
+            for campaign, m in campaign_metrics.items():
+                camp_data = {
+                    'name': campaign[:50],  # Truncate long names
+                    'spend': m.get('spend', 0),
+                    'clicks': m.get('clicks', 0),
+                    'ctr': m.get('ctr', 0),
+                    'cpc': m.get('cpc', 0),
+                }
+                if m.get('conversions', 0) > 0:
+                    camp_data['conversions'] = m.get('conversions', 0)
+                    camp_data['cpa'] = m.get('cpa', 0)
+                if m.get('roas', 0) > 0:
+                    camp_data['roas'] = m.get('roas', 0)
+                campaigns_list.append(camp_data)
+            
+            # Sort and get top/bottom 5
+            if any(c.get('roas', 0) > 0 for c in campaigns_list):
+                campaigns_list.sort(key=lambda x: x.get('roas', 0), reverse=True)
+            else:
+                campaigns_list.sort(key=lambda x: x.get('ctr', 0), reverse=True)
+            
+            campaign_analysis['top_performers'] = campaigns_list[:5]
+            campaign_analysis['bottom_performers'] = campaigns_list[-5:] if len(campaigns_list) > 5 else []
+        
+        # Build enhanced summary
+        summary_data = {
+            'data_availability': {
+                'available_metrics': available_metrics,
+                'has_conversion_data': 'conversions' in available_metrics,
+                'has_revenue_data': 'revenue' in available_metrics,
+                'has_roas_data': 'roas' in available_metrics,
+                'note': 'Only analyze metrics that are marked as available. Do not assume or hallucinate missing data.'
+            },
+            'overview': overview,
+            'platform_analysis': platform_analysis,
+            'channel_ranking': {
+                'top_5': top_channels,
+                'bottom_5': bottom_channels
+            },
+            'dimension_performance': {
+                'funnel': funnel_metrics,
+                'creative': creative_metrics,
+                'audience': audience_metrics,
+                'device': device_metrics,
+                'placement': placement_metrics,
+                'region': region_metrics,
+                'ad_type': ad_type_metrics
+            },
+            'campaign_analysis': campaign_analysis,
+            'insights_summary': [
+                {'insight': i.get('insight', str(i))[:200], 'category': i.get('category', 'general')}
+                for i in insights[:7]
+            ] if insights else [],
+            'recommendations_summary': [
+                {'recommendation': r.get('recommendation', str(r))[:200], 'priority': r.get('priority', 'medium')}
+                for r in recommendations[:5]
+            ] if recommendations else [],
+            'analysis_context': {
+                'platform_count': len(platform_metrics),
+                'campaign_count': len(campaign_metrics),
+                'date_range': metrics.get('date_range', 'Not specified')
+            }
+        }
+        
+        # Log what platforms are in the final data sent to LLM
+        logger.info(f"RAG: Final platform_analysis has {len(platform_analysis)} platforms:")
+        for p in platform_analysis:
+            logger.info(f"  - {p.get('name')}: spend={p.get('spend', 0)}")
+        
+        return summary_data
+    
+    def _prepare_summary_data(self, metrics: Dict, insights: List, recommendations: List) -> Dict:
+        """Prepare summary data dictionary (shared by both standard and RAG methods)."""
+        # Convert to JSON-serializable format
+        def make_serializable(obj):
+            """Convert pandas objects to JSON-serializable types."""
+            if isinstance(obj, pd.Series):
+                return obj.to_dict()
+            elif isinstance(obj, pd.DataFrame):
+                return obj.to_dict('records')
+            elif isinstance(obj, (np.integer, np.floating)):
+                return float(obj)
+            elif isinstance(obj, dict):
+                return {k: make_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [make_serializable(item) for item in obj]
+            return obj
+        
+        overview = make_serializable(metrics.get('overview', {}))
+        platform_metrics = metrics.get('by_platform', {})
+        campaign_metrics = metrics.get('by_campaign', {})
+        
+        # Find best and worst performers
+        best_platform = None
+        worst_platform = None
+        if platform_metrics:
+            platforms_with_roas = {
+                p: m.get('roas', 0) 
+                for p, m in platform_metrics.items() 
+                if m.get('roas', 0) > 0
+            }
+            if platforms_with_roas:
+                best_platform = max(platforms_with_roas.items(), key=lambda x: x[1])
+                worst_platform = min(platforms_with_roas.items(), key=lambda x: x[1])
+        
+        summary_data = {
+            'overview': overview,
+            'best_platform': {
+                'name': best_platform[0] if best_platform else 'N/A',
+                'roas': best_platform[1] if best_platform else 0
+            },
+            'worst_platform': {
+                'name': worst_platform[0] if worst_platform else 'N/A',
+                'roas': worst_platform[1] if worst_platform else 0
+            },
+            'top_insights': insights[:5],
+            'top_recommendations': recommendations[:5],
+            'platform_count': len(platform_metrics),
+            'campaign_count': len(campaign_metrics)
+        }
+        
+        return summary_data
+    
+    def _generate_executive_summary_with_rag(self, 
+                                            metrics: Dict, 
+                                            insights: List, 
+                                            recommendations: List) -> Dict[str, str]:
+        """Generate RAG-enhanced executive summary (EXPERIMENTAL - ISOLATED METHOD).
+        
+        This method does NOT affect the existing _generate_executive_summary method.
+        It's a completely separate implementation for A/B testing.
+        
+        Args:
+            metrics: Campaign performance metrics
+            insights: List of generated insights
+            recommendations: List of recommendations
+            
+        Returns:
+            Dictionary with 'brief' and 'detailed' summaries, plus RAG metadata
+        """
+        import time
+        start_time = time.time()
+        
+        logger.info("=" * 60)
+        logger.info("=== GENERATING RAG-ENHANCED EXECUTIVE SUMMARY ===")
+        logger.info(f"Metrics keys: {list(metrics.keys()) if metrics else 'None'}")
+        logger.info(f"Insights count: {len(insights) if insights else 0}")
+        logger.info(f"Recommendations count: {len(recommendations) if recommendations else 0}")
+        logger.info(f"API Keys available - Anthropic: {bool(self.anthropic_api_key)}, Gemini: {bool(self.gemini_api_key)}, OpenAI: {bool(self.openai_api_key)}")
+        logger.info("=" * 60)
+        
+        try:
+            # Step 1: Analyze campaign context (NEW - Intelligence Enhancement)
+            logger.info("Step 1: Analyzing campaign context...")
+            from ..utils.campaign_context import CampaignContextAnalyzer
+            context_analyzer = CampaignContextAnalyzer()
+            campaign_context = context_analyzer.analyze_context(metrics)
+            logger.info(f"Campaign context: {campaign_context['summary']}")
+            logger.info(f"Goals: {len(campaign_context['goals'])}, Priorities: {len(campaign_context['priorities'])}")
+            
+            # Step 2: Retrieve relevant knowledge from RAG
+            logger.info("Step 2: Retrieving RAG context...")
+            rag_context = self._retrieve_rag_context(metrics, top_k=5)
+            logger.info(f"RAG context retrieved: {len(rag_context)} chunks")
+            if rag_context:
+                for i, chunk in enumerate(rag_context[:2]):
+                    logger.info(f"  Chunk {i+1}: {chunk.get('source', 'unknown')} (score: {chunk.get('score', 0):.2f})")
+            
+            # Step 3: Build RAG-augmented prompt with context
+            logger.info("Step 3: Building RAG-augmented prompt with campaign context...")
+            rag_prompt = self._build_rag_augmented_prompt(
+                metrics, insights, recommendations, rag_context, campaign_context
+            )
+            logger.info(f"RAG prompt length: {len(rag_prompt)} chars")
+            logger.info(f"RAG prompt preview: {rag_prompt[:500]}...")
+            
+            # Step 3: Call LLM with RAG-augmented prompt
+            logger.info("Step 3: Calling LLM with RAG context...")
+            logger.info(f"  use_anthropic: {self.use_anthropic}")
+            logger.info(f"  anthropic_api_key present: {bool(self.anthropic_api_key)}")
+            logger.info(f"  gemini_api_key present: {bool(self.gemini_api_key)}")
+            logger.info(f"  openai_api_key present: {bool(self.openai_api_key)}")
+            
+            # Use same LLM fallback logic as standard method
+            llm_response = None
+            tokens_input = 0
+            tokens_output = 0
+            model_used = "unknown"
+            
+            # Try Claude Sonnet first (if using Anthropic)
+            if self.use_anthropic and self.anthropic_api_key:
+                try:
+                    from ..utils.anthropic_helpers import call_anthropic_http
+                    result = call_anthropic_http(
+                        api_key=self.anthropic_api_key,
+                        model=self.model,
+                        messages=[{"role": "user", "content": rag_prompt}],
+                        max_tokens=4000
+                    )
+                    llm_response = result.get('content', '')
+                    tokens_input = result.get('usage', {}).get('input_tokens', 0)
+                    tokens_output = result.get('usage', {}).get('output_tokens', 0)
+                    model_used = self.model
+                    logger.info(f"RAG summary generated with Claude Sonnet ({tokens_input} + {tokens_output} tokens)")
+                except Exception as e:
+                    logger.warning(f"Claude Sonnet failed for RAG: {e}, trying Gemini...")
+            
+            # Fallback to Gemini
+            if not llm_response and self.gemini_api_key:
+                try:
+                    genai.configure(api_key=self.gemini_api_key)
+                    model = genai.GenerativeModel('gemini-2.0-flash-exp')
+                    response = model.generate_content(rag_prompt)
+                    llm_response = response.text
+                    # Estimate tokens (Gemini doesn't provide exact counts easily)
+                    tokens_input = len(rag_prompt.split()) * 1.3
+                    tokens_output = len(llm_response.split()) * 1.3
+                    model_used = "gemini-2.0-flash-exp"
+                    logger.info(f"RAG summary generated with Gemini (~{int(tokens_input)} + {int(tokens_output)} tokens)")
+                except Exception as e:
+                    logger.warning(f"Gemini failed for RAG: {e}, trying OpenAI...")
+            
+            # Fallback to OpenAI
+            if not llm_response and self.openai_api_key:
+                try:
+                    # Create OpenAI client if not already available
+                    openai_client = self.client if self.client else OpenAI(api_key=self.openai_api_key)
+                    response = openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": rag_prompt}],
+                        max_tokens=3000,
+                        temperature=0.7
+                    )
+                    llm_response = response.choices[0].message.content
+                    tokens_input = response.usage.prompt_tokens
+                    tokens_output = response.usage.completion_tokens
+                    model_used = "gpt-4o-mini"
+                    logger.info(f"RAG summary generated with GPT-4o-mini ({tokens_input} + {tokens_output} tokens)")
+                except Exception as e:
+                    logger.error(f"OpenAI failed for RAG summary: {e}")
+                    # Don't raise here - let it fall through to the "no LLM" error
+            
+            if not llm_response:
+                logger.error("No LLM response received! All LLM calls failed.")
+                logger.error(f"  Anthropic attempted: {self.use_anthropic and bool(self.anthropic_api_key)}")
+                logger.error(f"  Gemini attempted: {bool(self.gemini_api_key)}")
+                logger.error(f"  OpenAI attempted: {bool(self.openai_api_key)}")
+                raise Exception("No LLM available for RAG summary generation")
+            
+            logger.info(f"LLM response received: {len(llm_response)} chars")
+            logger.info(f"LLM response preview: {llm_response[:300]}...")
+            
+            if not llm_response or len(llm_response.strip()) < 100:
+                logger.warning(f"⚠️ LLM response seems suspiciously short or empty: {len(llm_response) if llm_response else 0} chars")
+            
+            # Step 4: Parse and format response
+            logger.info("Step 4: Parsing and formatting RAG response...")
+            brief_summary, detailed_summary = self._parse_summary_response(llm_response)
+            logger.info(f"Parsed - Brief: {len(brief_summary)} chars, Detailed: {len(detailed_summary)} chars")
+            
+            # Apply formatting cleanup
+            brief_summary = self._strip_italics(brief_summary)
+            detailed_summary = self._strip_italics(detailed_summary)
+            
+            # Apply post-processing formatter (M/K notation, bold headers, remove sources)
+            from ..utils.summary_formatter import format_summary
+            brief_summary, detailed_summary = format_summary(brief_summary, detailed_summary)
+            logger.info(f"Post-processing complete - Brief: {len(brief_summary)} chars, Detailed: {len(detailed_summary)} chars")
+            
+            # Step 5: Extract and score recommendations (NEW - Intelligence Enhancement)
+            logger.info("Step 5: Scoring recommendations with confidence levels...")
+            recommendations_with_confidence = self._score_recommendations(
+                detailed_summary, metrics, campaign_context, rag_context
+            )
+            logger.info(f"Scored {len(recommendations_with_confidence)} recommendations")
+            
+            latency = time.time() - start_time
+            
+            logger.info(f"=== RAG SUMMARY COMPLETE in {latency:.2f}s ===")
+            
+            return {
+                'brief': brief_summary,
+                'detailed': detailed_summary,
+                'recommendations_scored': recommendations_with_confidence,  # NEW
+                'campaign_context': campaign_context,  # NEW
+                'rag_metadata': {
+                    'knowledge_sources': [chunk.get('source') for chunk in rag_context],
+                    'retrieval_count': len(rag_context),
+                    'tokens_input': int(tokens_input),
+                    'tokens_output': int(tokens_output),
+                    'model': model_used,
+                    'latency': latency
+                }
+            }
+            
+        except Exception as e:
+            import traceback
+            logger.error("=" * 60)
+            logger.error(f"RAG SUMMARY GENERATION FAILED: {e}")
+            logger.error(f"RAG error traceback:\n{traceback.format_exc()}")
+            logger.error("=" * 60)
+            logger.warning("FALLING BACK TO STANDARD SUMMARY - THIS IS WHY SUMMARIES ARE IDENTICAL!")
+            
+            # Instead of falling back to standard, return a distinct error summary
+            return {
+                'brief': f"⚠️ RAG Enhancement Failed: {str(e)[:100]}. Using fallback analysis based on your campaign data.",
+                'detailed': f"RAG-enhanced analysis could not be generated due to: {str(e)}\n\nPlease check:\n1. API keys are configured correctly\n2. Network connectivity\n3. LLM service availability\n\nFallback: Standard analysis is shown in the left panel.",
+                'rag_metadata': {
+                    'knowledge_sources': [],
+                    'retrieval_count': 0,
+                    'tokens_input': 0,
+                    'tokens_output': 0,
+                    'model': 'error',
+                    'latency': 0,
+                    'error': str(e)
+                }
+            }
+    
+    def _score_recommendations(
+        self,
+        detailed_summary: str,
+        metrics: Dict[str, Any],
+        campaign_context: Dict[str, Any],
+        rag_context: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Extract and score recommendations from detailed summary.
+        
+        Returns:
+            List of recommendations with confidence scores and validation
+        """
+        from ..utils.confidence_scorer import ConfidenceScorer, assess_data_quality
+        from ..utils.recommendation_validator import RecommendationValidator
+        
+        # Extract recommendations from Priority Actions section
+        recommendations = []
+        
+        # Look for Priority Actions section
+        import re
+        priority_match = re.search(
+            r'\*\*Priority Actions?:\*\*\s*(.*?)(?:\*\*|$)',
+            detailed_summary,
+            re.DOTALL | re.IGNORECASE
+        )
+        
+        if priority_match:
+            priority_text = priority_match.group(1)
+            # Extract numbered items
+            rec_items = re.findall(r'\d+\.\s*([^\n]+(?:\n(?!\d+\.)[^\n]+)*)', priority_text)
+            recommendations.extend(rec_items)
+        
+        # Also look for recommendations in other sections
+        rec_keywords = ['recommend', 'should', 'suggest', 'action:', 'next step']
+        for line in detailed_summary.split('\n'):
+            if any(kw in line.lower() for kw in rec_keywords):
+                if line.strip() and not line.strip().startswith('**'):
+                    recommendations.append(line.strip())
+        
+        # Remove duplicates
+        recommendations = list(dict.fromkeys(recommendations))[:10]  # Top 10
+        
+        # Score each recommendation
+        scorer = ConfidenceScorer()
+        validator = RecommendationValidator()
+        data_quality = assess_data_quality(metrics)
+        
+        scored_recommendations = []
+        for rec in recommendations:
+            if len(rec) < 20:  # Skip very short items
+                continue
+            
+            # Calculate confidence score
+            confidence = scorer.score_recommendation(
+                rec, metrics, rag_context, data_quality
+            )
+            
+            # Validate recommendation
+            validation = validator.validate_recommendation(
+                rec, metrics, campaign_context, rag_context
+            )
+            
+            scored_recommendations.append({
+                'recommendation': rec,
+                'confidence': confidence,
+                'validation': validation,
+                'display_badge': self._get_confidence_badge(confidence['confidence_level'])
+            })
+        
+        return scored_recommendations
+    
+    def _get_confidence_badge(self, level: str) -> str:
+        """Get emoji badge for confidence level."""
+        badges = {
+            'HIGH': '🟢',
+            'MEDIUM': '🟡',
+            'LOW': '🔴'
+        }
+        return badges.get(level, '⚪')

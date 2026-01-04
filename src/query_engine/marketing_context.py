@@ -5,6 +5,236 @@ Provides marketing context, metrics definitions, and business rules to improve
 natural language to SQL query generation.
 """
 
+# ====================================================================================
+# CRITICAL MARKETING ANALYTICS PRINCIPLES (Rand Fishkin + Alex Freberg approach)
+# These rules OVERRIDE generic SQL knowledge for marketing analytics
+# ====================================================================================
+
+MARKETING_ANALYTICS_PRINCIPLES = """
+# CRITICAL MARKETING ANALYTICS RULES
+
+## Rule 1: AGGREGATION - Never average pre-calculated rates
+❌ NEVER: SELECT AVG(CTR), AVG(ROAS), AVG(CPA) - mathematically WRONG
+✅ ALWAYS: Calculate from totals using SUM(numerator)/NULLIF(SUM(denominator), 0)
+
+## Rule 2: TEMPORAL - Anchor to actual data, not current date
+❌ NEVER: WHERE date >= CURRENT_DATE - INTERVAL '7 days'
+✅ ALWAYS: WHERE date >= (SELECT MAX(date) FROM campaigns) - INTERVAL '7 days'
+
+## Rule 3: NULL SAFETY - Every division must handle zero denominators
+❌ NEVER: spend/conversions (will crash on zero conversions!)
+✅ ALWAYS: spend/NULLIF(conversions, 0)
+
+## Rule 4: PERCENTILES - Use percentiles, not arbitrary thresholds
+❌ NEVER: WHERE ROAS > 3.0 (arbitrary, data-blind)
+✅ BETTER: ORDER BY ROAS DESC LIMIT 10 (relative ranking)
+✅ BEST: PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY ROAS) for top quartile
+
+## Rule 5: FUNNEL VALIDATION - Use ONLY for data quality analysis
+⚠️ IMPORTANT: Do NOT add funnel filters to simple aggregate queries!
+❌ NEVER add funnel filter for "What's the CPA?" or total metrics - it excludes real data
+✅ ONLY use funnel filter when user asks about data quality or anomalies:
+   - "Are there any data issues?"
+   - "Show me corrupted rows"
+   - For these, use: WHERE clicks <= impressions AND conversions <= clicks
+
+## Rule 6: SAMPLE SIZE - Include confidence indicators
+✅ ALWAYS add to results:
+   - SUM(conversions) AS sample_size
+   - CASE WHEN SUM(conversions) < 100 THEN 'Low Confidence' ELSE 'High Confidence' END AS confidence
+
+## Rule 7: DATE HANDLING - Dates are stored as proper datetime type
+✅ The Date column is stored as datetime64 (proper DATE type)
+✅ Use CAST("Date" AS DATE) for date operations - works correctly
+✅ For date comparisons:
+   - MAX: CAST(MAX("Date") AS DATE) AS max_date
+   - Filter: WHERE CAST("Date" AS DATE) >= max_date - INTERVAL '7 days'
+ℹ️ If dates appear as strings (DD/MM/YY), re-upload the data to fix.
+
+## Rule 8: CAMPAIGN TYPE AWARENESS - Distinguish awareness vs conversion campaigns
+❌ WRONG: Just using NULLIF hides zero-conversion campaigns
+✅ ALWAYS: Include campaign_type classification when showing CPA:
+   - Conversion campaigns: Has conversions > 0, CPA is meaningful
+   - Awareness campaigns: Has impressions but 0 conversions, CPA = NULL (not applicable)
+   - No activity: No impressions, exclude or flag
+
+## Rule 9: DATE FORMATTING - Always include date in temporal queries
+⚠️ MANDATORY: When query involves time periods, ALWAYS include a date column in results:
+   - For DAILY data: Show date as-is (YYYY-MM-DD)
+   - For WEEKLY data: Show DATE_TRUNC('week', CAST("Date" AS DATE)) AS week_start
+   - For MONTHLY data: Use STRFTIME(CAST("Date" AS DATE), 'Mon-YY') AS month (e.g., 'Oct-25', 'Jan-24', 'Sep-23')
+   
+Templates:
+```sql
+-- Weekly aggregation with formatted date
+DATE_TRUNC('week', CAST("Date" AS DATE)) AS week_start
+
+-- Monthly aggregation with readable format  
+STRFTIME(CAST("Date" AS DATE), 'Mon-YY') AS month
+```
+
+## Rule 10: CONSISTENT PERFORMANCE KPIs - Standard metrics for all performance queries
+⚠️ MANDATORY: When user asks for "performance" at ANY granularity, ALWAYS include these standard KPIs:
+   1. Total Spend (SUM("Total Spent"))
+   2. Total Conversions (SUM("Site Visit"))
+   3. CPA (SUM("Total Spent") / NULLIF(SUM("Site Visit"), 0))
+   4. CTR (SUM(Clicks) * 100.0 / NULLIF(SUM(Impressions), 0))
+   5. Impressions (SUM(Impressions))
+   6. Clicks (SUM(Clicks))
+   7. ROAS (SUM(Revenue_2024) / NULLIF(SUM("Total Spent"), 0))
+
+This ensures consistent, comparable results across all aggregation levels (daily, weekly, monthly, by platform, by channel, etc.)
+
+## METRIC CALCULATION TEMPLATES (Copy-paste these EXACTLY)
+
+```sql
+-- CTR (Click-Through Rate) - % of impressions that become clicks
+SUM(clicks) * 100.0 / NULLIF(SUM(impressions), 0) AS CTR
+
+-- CPC (Cost Per Click) - Average cost per click
+SUM(spend) / NULLIF(SUM(clicks), 0) AS CPC
+
+-- CPM (Cost Per Mille) - Cost per 1000 impressions
+SUM(spend) * 1000.0 / NULLIF(SUM(impressions), 0) AS CPM
+
+-- CPA (Cost Per Acquisition) - NUANCED VERSION with campaign type
+SUM(spend) / NULLIF(SUM(conversions), 0) AS CPA,
+CASE 
+    WHEN SUM(conversions) > 0 THEN 'Conversion Campaign'
+    WHEN SUM(impressions) > 0 THEN 'Awareness Only'
+    ELSE 'No Activity'
+END AS campaign_type
+
+-- CVR (Conversion Rate) - % of clicks that convert
+SUM(conversions) * 100.0 / NULLIF(SUM(clicks), 0) AS CVR
+
+-- ROAS (Return on Ad Spend) - Revenue per dollar spent
+SUM(revenue) / NULLIF(SUM(spend), 0) AS ROAS
+```
+
+## PERIOD-OVER-PERIOD COMPARISON TEMPLATE
+⚠️ "Compare last 2 weeks" means: Week 1 (Dec 25-31) vs Week 2 (Dec 18-24)
+```sql
+WITH bounds AS (
+    SELECT CAST(MAX("Date") AS DATE) AS max_date FROM campaigns
+),
+date_ranges AS (
+    SELECT 
+        max_date,
+        max_date - INTERVAL '6 days' AS current_start,   -- Current week (7 days): Dec 25-31
+        max_date - INTERVAL '7 days' AS previous_end,    -- Previous week end: Dec 24
+        max_date - INTERVAL '13 days' AS previous_start  -- Previous week start: Dec 18
+    FROM bounds
+),
+current_period AS (
+    SELECT SUM("Total Spent") AS spend, SUM("Site Visit") AS conversions
+    FROM campaigns, date_ranges
+    WHERE CAST("Date" AS DATE) >= current_start AND CAST("Date" AS DATE) <= max_date
+),
+previous_period AS (
+    SELECT SUM("Total Spent") AS spend, SUM("Site Visit") AS conversions
+    FROM campaigns, date_ranges
+    WHERE CAST("Date" AS DATE) >= previous_start AND CAST("Date" AS DATE) <= previous_end
+)
+SELECT 
+    -- Date range labels
+    (SELECT STRFTIME(current_start, '%b %d') || ' - ' || STRFTIME(max_date, '%b %d') FROM date_ranges) AS current_period,
+    (SELECT STRFTIME(previous_start, '%b %d') || ' - ' || STRFTIME(previous_end, '%b %d') FROM date_ranges) AS previous_period,
+    -- Spend comparison
+    c.spend AS current_spend,
+    p.spend AS previous_spend,
+    ROUND((c.spend - p.spend) * 100.0 / NULLIF(p.spend, 0), 1) AS spend_change_pct,
+    -- Conversions comparison
+    c.conversions AS current_conversions,
+    p.conversions AS previous_conversions,
+    ROUND((c.conversions - p.conversions) * 100.0 / NULLIF(p.conversions, 0), 1) AS conversions_change_pct,
+    -- Performance summary
+    CASE WHEN c.spend < p.spend AND c.conversions >= p.conversions THEN '✅ Improved efficiency'
+         WHEN c.spend > p.spend AND c.conversions <= p.conversions THEN '⚠️ Declining efficiency'
+         ELSE '➡️ Stable' END AS performance_summary
+FROM current_period c, previous_period p;
+```
+
+⚠️ CRITICAL for "compare X weeks" queries:
+- ALWAYS include BOTH current_period AND previous_period date labels
+- ALWAYS show side-by-side values (current_X, previous_X) 
+- ALWAYS calculate percentage change: (current - previous) / previous * 100
+
+## Rule 11: OPERATIONALIZE AMBIGUOUS TERMS - Define vague terms explicitly
+⚠️ MANDATORY: When user uses ambiguous terms, operationalize them:
+
+| Term | Definition |
+|------|------------|
+| "recently" | Last 7 days (vs baseline of previous 3 weeks) |
+| "underperforming" | CPA increased >20% vs baseline, or ROAS decreased >20% |
+| "best" / "worst" | ORDER BY metric DESC/ASC LIMIT 10 |
+| "wasting money" | High spend + low/no conversions (CPA > 2x average) |
+| "performing well" | CPA improved or ROAS improved vs baseline |
+
+## Rule 12: YEAR-SPECIFIC REVENUE COLUMNS - Combine for ROAS
+⚠️ CRITICAL: Revenue is split by year in this dataset:
+- Revenue_2024: Only has values for 2024 data (zero for 2025)
+- Revenue_2025: Only has values for 2025 data (zero for 2024)
+
+✅ ALWAYS calculate total revenue as:
+   COALESCE(Revenue_2024, 0) + COALESCE(Revenue_2025, 0) AS total_revenue
+
+❌ NEVER use just Revenue_2024 - it will show 0 for current 2025 data!
+
+Example ROAS calculation:
+```sql
+(COALESCE(SUM(Revenue_2024), 0) + COALESCE(SUM(Revenue_2025), 0)) / NULLIF(SUM("Total Spent"), 0) AS roas
+```
+
+## UNDERPERFORMING CAMPAIGNS TEMPLATE
+⚠️ Use this template for queries like "underperforming campaigns", "campaigns that got worse":
+```sql
+WITH time_bounds AS (
+    SELECT 
+        STRPTIME(MAX("Date"), '%d/%m/%y')::DATE AS max_date,
+        STRPTIME(MAX("Date"), '%d/%m/%y')::DATE - INTERVAL '6 days' AS week_start,
+        STRPTIME(MAX("Date"), '%d/%m/%y')::DATE - INTERVAL '29 days' AS month_start
+    FROM campaigns
+),
+recent_performance AS (
+    SELECT 
+        Campaign_Name_Full,
+        SUM("Total Spent") / NULLIF(SUM("Site Visit"), 0) AS recent_CPA,
+        SUM("Site Visit") AS recent_conversions
+    FROM campaigns, time_bounds
+    WHERE CAST("Date" AS DATE) >= week_start
+    GROUP BY Campaign_Name_Full
+),
+baseline_performance AS (
+    SELECT 
+        Campaign_Name_Full,
+        SUM("Total Spent") / NULLIF(SUM("Site Visit"), 0) AS baseline_CPA
+    FROM campaigns, time_bounds
+    WHERE CAST("Date" AS DATE) >= month_start 
+      AND CAST("Date" AS DATE) < week_start
+    GROUP BY Campaign_Name_Full
+)
+SELECT 
+    r.Campaign_Name_Full,
+    ROUND(r.recent_CPA, 2) AS recent_CPA,
+    ROUND(b.baseline_CPA, 2) AS baseline_CPA,
+    r.recent_conversions,
+    ROUND((r.recent_CPA - b.baseline_CPA) / NULLIF(b.baseline_CPA, 0) * 100, 2) AS cpa_increase_pct,
+    CASE 
+        WHEN r.recent_conversions < 5 THEN 'Too few conversions to judge'
+        WHEN r.recent_CPA > b.baseline_CPA * 1.5 THEN 'Significantly worse (50%+ increase)'
+        WHEN r.recent_CPA > b.baseline_CPA * 1.2 THEN 'Moderately worse (20%+ increase)'
+        WHEN r.recent_CPA > b.baseline_CPA THEN 'Slightly worse'
+        ELSE 'Not underperforming'
+    END AS performance_status
+FROM recent_performance r
+JOIN baseline_performance b ON r.Campaign_Name_Full = b.Campaign_Name_Full
+WHERE r.recent_CPA > b.baseline_CPA
+  AND r.recent_conversions >= 5
+ORDER BY cpa_increase_pct DESC;
+```
+"""
+
 MARKETING_GLOSSARY = """
 # Marketing Analytics Glossary
 
@@ -284,6 +514,8 @@ When user asks about time comparisons, understand these patterns:
 """
     
     return f"""
+{MARKETING_ANALYTICS_PRINCIPLES}
+
 {base_glossary}
 
 {data_context}
@@ -293,11 +525,12 @@ When user asks about time comparisons, understand these patterns:
 {QUERY_CONTEXT}
 
 IMPORTANT: Use this marketing knowledge to:
-1. **Understand intent, not just keywords** - Be Steve Jobs level intuitive
-2. **Match semantically** - Find CLOSEST column to user's intent
-3. **Be flexible** - Work with what's available, don't fail on exact matches
-4. **Think holistically** - Consider full question context
-5. Use EXACT column names from available dimensions
+1. **Follow CRITICAL RULES above** - They override generic SQL patterns
+2. **Understand intent, not just keywords** - Be Steve Jobs level intuitive
+3. **Match semantically** - Find CLOSEST column to user's intent
+4. **Be flexible** - Work with what's available, don't fail on exact matches
+5. **Think holistically** - Consider full question context
+6. Use EXACT column names from available dimensions
 """
 
 

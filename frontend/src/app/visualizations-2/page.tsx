@@ -14,6 +14,7 @@ import { MultiSelect } from "@/components/ui/multi-select";
 import { api } from '@/lib/api';
 import { computeDataAvailability, DataAvailability } from '@/hooks/useDataAvailability';
 import { DashboardProvider, useDashboard } from '@/context/DashboardContext';
+import { useDashboardVisualizations, useDashboardStats } from '@/hooks/useDashboardQueries';
 import { FeatureBox, FeatureItem } from '@/components/layout/FeatureBox';
 import { Separator } from '@/components/ui/separator';
 
@@ -144,6 +145,8 @@ function AdsOverviewContent() {
     const [sourceFilter, setSourceFilter] = useState('all');
     const { comparison, setSelectedDateRange } = useDashboard();
 
+    // Hooks moved lower to access filters state
+
     // Drill-down state
     const [drillDownOpen, setDrillDownOpen] = useState(false);
     const [drillDownData, setDrillDownData] = useState<{ dimension: string; value: string; data: any[] }>({
@@ -247,6 +250,88 @@ function AdsOverviewContent() {
     const placementOptions = availablePlacements.map(p => ({ label: p, value: p }));
     const regionOptions = availableRegions.map(r => ({ label: r, value: r }));
     const adTypeOptions = availableAdTypes.map(a => ({ label: a, value: a }));
+
+    // Transform filters for React Query (DateRange type compatibility)
+    const queryFilters = useMemo(() => ({
+        ...filters,
+        dateRange: filters.dateRange?.from && filters.dateRange?.to
+            ? { from: filters.dateRange.from, to: filters.dateRange.to }
+            : undefined
+    }), [filters]);
+
+    // Hooks for data fetching
+    const { data: visualizations, isLoading: visualsLoading } = useDashboardVisualizations(queryFilters, sourceFilter, {
+        selectedDevice, selectedRegion, selectedAudience, selectedAge,
+        selectedAdType, selectedObjective, selectedTargeting, selectedFunnelStage
+    });
+
+    const { data: stats, isLoading: statsLoading } = useDashboardStats(queryFilters, sourceFilter, {
+        selectedDevice, selectedRegion, selectedAudience, selectedAge,
+        selectedAdType, selectedObjective, selectedTargeting, selectedFunnelStage
+    });
+
+    // Update loading state based on hooks
+    useEffect(() => {
+        setLoading(visualsLoading || statsLoading);
+    }, [visualsLoading, statsLoading]);
+
+    // Sync Visualizations Data
+    useEffect(() => {
+        if (visualizations) {
+            if (visualizations.platform && visualizations.platform.length > 0) {
+                const totals = visualizations.platform.reduce((acc: any, p: any) => ({
+                    spend: acc.spend + (p.spend || 0),
+                    impressions: acc.impressions + (p.impressions || 0),
+                    clicks: acc.clicks + (p.clicks || 0),
+                    conversions: acc.conversions + (p.conversions || 0),
+                    revenue: acc.revenue + (p.revenue || 0),
+                    reach: acc.reach + (p.reach || 0)
+                }), { spend: 0, impressions: 0, clicks: 0, conversions: 0, revenue: 0, reach: 0 });
+
+                const ctr = totals.impressions > 0 ? (totals.clicks / totals.impressions * 100) : 0;
+                const cpm = totals.impressions > 0 ? (totals.spend / totals.impressions * 1000) : 0;
+                const cpc = totals.clicks > 0 ? (totals.spend / totals.clicks) : 0;
+                const roas = totals.spend > 0 ? ((totals.revenue || 0) / totals.spend) : 0;
+                const reach = totals.reach > 0 ? totals.reach : Math.round(totals.impressions * 0.65);
+
+                setKpis({
+                    spend: totals.spend,
+                    impressions: totals.impressions,
+                    clicks: totals.clicks,
+                    conversions: totals.conversions,
+                    revenue: totals.revenue,
+                    reach,
+                    ctr, cpm, cpc, roas
+                });
+                setPlatformData(visualizations.platform);
+            }
+
+            if (visualizations.channel) {
+                const mappedChannelData = visualizations.channel.map((ch: any) => ({
+                    ...ch,
+                    channel: ch.name || ch.channel
+                }));
+                setChannelData(mappedChannelData);
+            }
+            if (visualizations.trend) setTrendData(visualizations.trend);
+            if (visualizations.region) setRegionData(visualizations.region);
+            if (visualizations.audience) setAudienceData(visualizations.audience);
+            if (visualizations.age) setAgeData(visualizations.age);
+            if (visualizations.ad_type) setAdTypeData(visualizations.ad_type);
+            if (visualizations.objective) setObjectiveData(visualizations.objective);
+            if (visualizations.targeting) setTargetingData(visualizations.targeting);
+            if (visualizations.device) setDeviceData(visualizations.device);
+        }
+    }, [visualizations]);
+
+    // Sync Stats Data
+    useEffect(() => {
+        if (stats) {
+            setDashboardStats(stats as any);
+            if ((stats as any).funnel) setFunnelStageDataFromBackend((stats as any).funnel);
+            if ((stats as any).channel_by_funnel) setChannelByFunnelData((stats as any).channel_by_funnel);
+        }
+    }, [stats]);
 
     // Compute data availability for dynamic rendering
     const dataAvailability: DataAvailability = useMemo(() => {
@@ -730,7 +815,6 @@ function AdsOverviewContent() {
     // Auto-refresh data on initial load and source filter changes only (filters apply on button click)
     useEffect(() => {
         const timer = setTimeout(() => {
-            fetchData();
             fetchFilterOptions();
         }, 500); // Debounce: wait 500ms after source filter change
 
@@ -738,7 +822,6 @@ function AdsOverviewContent() {
     }, [sourceFilter, comparison]);
 
     useEffect(() => {
-        fetchData();
         fetchFilterOptions();
         fetchSchema();
     }, [filters.dateRange, selectedDevice, selectedRegion, selectedAudience, selectedAge, selectedAdType, selectedObjective, selectedTargeting, selectedFunnelStage]);
@@ -797,170 +880,7 @@ function AdsOverviewContent() {
         }
     }, [comparison, trendData]);
 
-    const fetchData = async () => {
-        try {
-            setLoading(true);
-            const filterParams: any = {};
-
-            console.log('fetchData called with filters:', {
-                regions: filters.regions,
-                adTypes: filters.adTypes,
-                channels: filters.channels,
-                placements: filters.placements
-            });
-
-            // Use global filters for all API calls
-            if (filters.platforms.length > 0) {
-                filterParams.platforms = filters.platforms.join(',');
-            } else if (sourceFilter && sourceFilter !== 'all') {
-                filterParams.platforms = sourceFilter;
-            }
-
-            if (filters.dateRange?.from) {
-                filterParams.startDate = filters.dateRange.from.toISOString().split('T')[0];
-            }
-            if (filters.dateRange?.to) {
-                filterParams.endDate = filters.dateRange.to.toISOString().split('T')[0];
-            }
-
-            if (filters.channels.length > 0) {
-                filterParams.channels = filters.channels.join(',');
-            }
-            if (filters.funnelStages.length > 0) {
-                filterParams.funnelStages = filters.funnelStages.join(',');
-            }
-            if (filters.devices.length > 0) {
-                filterParams.devices = filters.devices.join(',');
-            }
-            if (filters.placements.length > 0) {
-                filterParams.placements = filters.placements.join(',');
-            }
-            if (filters.regions.length > 0) {
-                filterParams.regions = filters.regions.join(',');
-            }
-            if (filters.adTypes.length > 0) {
-                filterParams.adTypes = filters.adTypes.join(',');
-            }
-
-            // Apply Dimension Selection Filters (Linking)
-            if (selectedDevice) filterParams.devices = filterParams.devices ? `${filterParams.devices},${selectedDevice}` : selectedDevice;
-            if (selectedRegion) filterParams.regions = filterParams.regions ? `${filterParams.regions},${selectedRegion}` : selectedRegion;
-            if (selectedAudience) filterParams.audiences = selectedAudience; // Note: plural 'audiences' for API consistency? Check campaigns.py. It uses 'audience' col alias. But param name? campaigns.py iterates search_filters.
-            if (selectedAge) filterParams.ages = selectedAge;
-            if (selectedAdType) filterParams.adTypes = filterParams.adTypes ? `${filterParams.adTypes},${selectedAdType}` : selectedAdType;
-            if (selectedObjective) filterParams.objectives = selectedObjective;
-            if (selectedTargeting) filterParams.targetings = selectedTargeting;
-            if (selectedFunnelStage) filterParams.funnelStages = filterParams.funnelStages ? `${filterParams.funnelStages},${selectedFunnelStage}` : selectedFunnelStage;
-
-            console.log('Sending filterParams to API:', filterParams);
-
-            let visualizations, stats;
-            try {
-                console.log('Calling getGlobalVisualizations...');
-                visualizations = await api.getGlobalVisualizations<VisualizationsData>(filterParams);
-                console.log('getGlobalVisualizations success:', !!visualizations);
-            } catch (err) {
-                console.error('getGlobalVisualizations failed:', err);
-                throw err;
-            }
-
-            try {
-                console.log('Calling dashboard-stats...');
-                // Build query string for dashboard-stats (api.get doesn't convert params to query string)
-                const statsParams = new URLSearchParams();
-                if (filterParams.startDate) statsParams.append('start_date', filterParams.startDate);
-                if (filterParams.endDate) statsParams.append('end_date', filterParams.endDate);
-                if (filterParams.platforms) statsParams.append('platforms', filterParams.platforms);
-                if (filterParams.channels) statsParams.append('channels', filterParams.channels);
-                if (filterParams.regions) statsParams.append('regions', filterParams.regions);
-                if (filterParams.devices) statsParams.append('devices', filterParams.devices);
-                if (filterParams.placements) statsParams.append('placements', filterParams.placements);
-                if (filterParams.adTypes) statsParams.append('adTypes', filterParams.adTypes);
-                if (filterParams.funnelStages) statsParams.append('funnelStages', filterParams.funnelStages);
-
-                // Add new dimension params for stats
-                if (filterParams.audiences) statsParams.append('audiences', filterParams.audiences);
-                if (filterParams.ages) statsParams.append('ages', filterParams.ages);
-                if (filterParams.objectives) statsParams.append('objectives', filterParams.objectives);
-                if (filterParams.targetings) statsParams.append('targetings', filterParams.targetings);
-                const statsQueryString = statsParams.toString();
-                const statsUrl = `/campaigns/dashboard-stats${statsQueryString ? `?${statsQueryString}` : ''}`;
-                console.log('dashboard-stats URL:', statsUrl);
-                stats = await api.get(statsUrl);
-                console.log('dashboard-stats success:', !!stats);
-            } catch (err) {
-                console.error('dashboard-stats failed:', err);
-                throw err;
-            }
-
-            setDashboardStats(stats as any);
-
-            if (visualizations.platform && visualizations.platform.length > 0) {
-                const totals = visualizations.platform.reduce((acc: any, p: any) => ({
-                    spend: acc.spend + (p.spend || 0),
-                    impressions: acc.impressions + (p.impressions || 0),
-                    clicks: acc.clicks + (p.clicks || 0),
-                    conversions: acc.conversions + (p.conversions || 0),
-                    revenue: acc.revenue + (p.revenue || 0),
-                    reach: acc.reach + (p.reach || 0)
-                }), { spend: 0, impressions: 0, clicks: 0, conversions: 0, revenue: 0, reach: 0 });
-
-                const ctr = totals.impressions > 0 ? (totals.clicks / totals.impressions * 100) : 0;
-                const cpm = totals.impressions > 0 ? (totals.spend / totals.impressions * 1000) : 0;
-                const cpc = totals.clicks > 0 ? (totals.spend / totals.clicks) : 0;
-                const roas = totals.spend > 0 ? ((totals.revenue || 0) / totals.spend) : 0;
-                // Use actual reach if available, otherwise estimate from impressions
-                const reach = totals.reach > 0 ? totals.reach : Math.round(totals.impressions * 0.65);
-
-                setKpis({
-                    spend: totals.spend,
-                    impressions: totals.impressions,
-                    clicks: totals.clicks,
-                    conversions: totals.conversions,
-                    revenue: totals.revenue,
-                    reach,
-                    ctr, cpm, cpc, roas
-                });
-
-                setPlatformData(visualizations.platform);
-            }
-
-            if (visualizations.channel && visualizations.channel.length > 0) {
-                // Map 'name' to 'channel' for PerformanceTable compatibility
-                const mappedChannelData = visualizations.channel.map((ch: any) => ({
-                    ...ch,
-                    channel: ch.name || ch.channel
-                }));
-                setChannelData(mappedChannelData);
-            }
-
-            if (visualizations.trend && visualizations.trend.length > 0) {
-                setTrendData(visualizations.trend);
-            }
-
-            // Set new dimension data
-            if (visualizations.region) setRegionData(visualizations.region);
-            if (visualizations.audience) setAudienceData(visualizations.audience);
-            if (visualizations.age) setAgeData(visualizations.age);
-            if (visualizations.ad_type) setAdTypeData(visualizations.ad_type);
-            if (visualizations.objective) setObjectiveData(visualizations.objective);
-            if (visualizations.targeting) setTargetingData(visualizations.targeting);
-            if (visualizations.device) setDeviceData(visualizations.device);
-
-            if ((stats as any).funnel && (stats as any).funnel.length > 0) {
-                setFunnelStageDataFromBackend((stats as any).funnel);
-            }
-
-            if ((stats as any).channel_by_funnel && (stats as any).channel_by_funnel.length > 0) {
-                setChannelByFunnelData((stats as any).channel_by_funnel);
-            }
-
-            setLoading(false);
-        } catch (error) {
-            console.error('Failed to fetch data:', error);
-            setLoading(false);
-        }
-    };
+    // fetchData removed in favor of React Query hooks
 
     // Comparison data fetching for Performance tab
     const fetchComparisonData = async () => {
@@ -1491,7 +1411,7 @@ function AdsOverviewContent() {
     };
 
     const applyFilters = () => {
-        fetchData();
+        // React Query handles refetching automatically
     };
 
     const resetFilters = () => {
@@ -1505,8 +1425,6 @@ function AdsOverviewContent() {
             adTypes: [],
             dateRange: undefined
         });
-        // Fetch data with cleared filters after state update
-        setTimeout(() => fetchData(), 0);
     };
 
     const handleDrillDown = (dimension: string, value: string) => {
@@ -1685,20 +1603,7 @@ function AdsOverviewContent() {
                         </h1>
                         <p className="text-muted-foreground">High-level performance insights</p>
                     </div>
-                    <div className="flex items-center gap-4">
-                        <ComparisonModeSelector />
-                        <Select value={sourceFilter} onValueChange={setSourceFilter}>
-                            <SelectTrigger className="w-[180px]">
-                                <SelectValue placeholder="All Sources" />
-                            </SelectTrigger>
-                            <SelectContent>
-                                <SelectItem value="all">All Sources</SelectItem>
-                                {platformData.map((p: any, idx: number) => (
-                                    <SelectItem key={p.name || idx} value={p.name || `platform-${idx}`}>{p.name || 'Unknown'}</SelectItem>
-                                ))}
-                            </SelectContent>
-                        </Select>
-                    </div>
+
                 </motion.div>
 
                 {/* Simple KPI Cards - All Metrics in Single Line */}

@@ -185,3 +185,59 @@ class LinkedInAdsConnector(BaseAdConnector):
     
     def get_accounts(self) -> List[Dict[str, Any]]:
         return [LINKEDIN_ACCOUNT] if self.use_mock else []
+
+    def get_ad_sets(self, campaign_id: str = None) -> List[Dict[str, Any]]:
+        """Get ad sets (mock only) - treating as child of Campaign for hierarchy view."""
+        if not self.use_mock:
+            return []
+            
+        ad_sets = []
+        campaigns = [c for c in LINKEDIN_CAMPAIGNS if not campaign_id or c["id"] == campaign_id]
+        
+        for camp in campaigns:
+            # Create 2 ad sets per campaign
+            for i in range(1, 3):
+                ad_sets.append({
+                    "id": f"{camp['id']}_aset_{i:03d}",
+                    "name": f"{camp['name']} - Target Audience {i}",
+                    "campaign_id": camp["id"],
+                    "status": camp["status"],
+                    "optimization_goal": camp["objective"],
+                    "spend": camp["spend"] * 0.5,
+                })
+        return ad_sets
+
+    def get_ads(self, campaign_id: str = None, ad_set_id: str = None) -> List[Dict[str, Any]]:
+        """Get ads (mock only)."""
+        if not self.use_mock:
+            return []
+            
+        ads = []
+        ad_sets = self.get_ad_sets(campaign_id)
+        if ad_set_id:
+            ad_sets = [aset for aset in ad_sets if aset["id"] == ad_set_id]
+            
+        for aset in ad_sets:
+            # Create 3 ads per ad set
+            for i in range(1, 4):
+                spend = aset["spend"] / 3
+                impressions = int(spend * 1000 / 35.0)  # CPM ~ $35 (LinkedIn is expensive)
+                clicks = int(impressions * 0.008)       # CTR ~ 0.8%
+                conversions = int(clicks * 0.08)        # CVR ~ 8%
+                
+                ads.append({
+                    "id": f"{aset['id']}_ad_{i:03d}",
+                    "name": f"{aset['name']} - Content {i}",
+                    "ad_set_id": aset["id"],
+                    "campaign_id": aset["campaign_id"],
+                    "status": aset["status"],
+                    "format": "SINGLE_IMAGE_AD",
+                    "spend": spend,
+                    "impressions": impressions,
+                    "clicks": clicks,
+                    "conversions": conversions,
+                    "ctr": 0.008,
+                    "cpc": spend / clicks if clicks > 0 else 0,
+                    "cpa": spend / conversions if conversions > 0 else 0,
+                })
+        return ads

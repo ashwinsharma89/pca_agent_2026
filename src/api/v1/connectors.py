@@ -394,7 +394,7 @@ async def get_platform_hierarchy(
     Get flattened hierarchy data: Campaign → Ad Group/Ad Set → Ad in single rows.
     Supports Google Ads (campaign→ad_group→ad) and Meta Ads (campaign→ad_set→ad).
     """
-    supported = ["google_ads", "meta_ads"]
+    supported = ["google_ads", "meta_ads", "tiktok_ads", "linkedin_ads"]
     if platform not in supported:
         raise HTTPException(
             status_code=400,
@@ -423,7 +423,8 @@ async def get_platform_hierarchy(
         # Build flattened rows
         rows = []
         
-        if platform == "google_ads":
+        if platform == "google_ads" or platform == "tiktok_ads":
+            # TikTok uses similar structure to Google (Ad Groups)
             ad_groups = connector.get_ad_groups(campaign_id=campaign_id)
             ads = connector.get_ads(campaign_id=campaign_id)
             ad_group_lookup = {ag["id"]: ag for ag in ad_groups}
@@ -458,7 +459,8 @@ async def get_platform_hierarchy(
                 }
                 rows.append(row)
         
-        else:  # meta_ads
+        else:  # meta_ads or linkedin_ads
+            # LinkedIn uses similar structure to Meta (Ad Sets)
             ad_sets = connector.get_ad_sets(campaign_id=campaign_id)
             ads = connector.get_ads(campaign_id=campaign_id)
             ad_set_lookup = {aset["id"]: aset for aset in ad_sets}

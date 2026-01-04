@@ -326,3 +326,20 @@ class EventHistoryListener:
         """Clear event history."""
         with self._lock:
             self._events.clear()
+
+
+# ============================================================================
+# Missing Listeners (Added for DI compatibility)
+# ============================================================================
+
+class AnalyticsEventListener(LoggingListener):
+    """Listener for analytics-specific events."""
+    pass
+
+class MonitoringEventListener(MetricsListener):
+    """Listener for monitoring and performance events."""
+    pass
+
+class AuditEventListener(LoggingListener):
+    """Listener for audit trail events."""
+    pass

@@ -1,16 +1,25 @@
 """
 Campaign service layer.
 Provides business logic for campaign operations.
+
+Extended to support:
+- SQL-based CRUD (via CampaignRepository)
+- Analytics queries (via DuckDBRepository)
+- Metrics calculation (via metrics utilities)
 """
 
 import logging
 import pandas as pd
 from typing import List, Dict, Any, Optional
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import uuid
 
 from src.database.repositories import CampaignRepository, AnalysisRepository, CampaignContextRepository
 from src.database.connection import DatabaseManager
+from src.database.duckdb_manager import get_duckdb_manager
+from src.database.duckdb_repository import get_duckdb_repository, DuckDBRepository
+from src.utils.metrics import calculate_all_metrics, calculate_metrics_from_df, safe_divide, calculate_percentage_change
+from src.utils.column_mapping import find_column, METRIC_COLUMN_ALIASES
 
 logger = logging.getLogger(__name__)
 
@@ -22,11 +31,21 @@ class CampaignService:
         self,
         campaign_repo: CampaignRepository,
         analysis_repo: AnalysisRepository,
-        context_repo: CampaignContextRepository
+        context_repo: CampaignContextRepository,
+        duckdb_repo: Optional[DuckDBRepository] = None
     ):
         self.campaign_repo = campaign_repo
         self.analysis_repo = analysis_repo
         self.context_repo = context_repo
+        # Lazy-load DuckDB repository if not provided
+        self._duckdb_repo = duckdb_repo
+    
+    @property
+    def duckdb_repo(self) -> DuckDBRepository:
+        """Lazy-load DuckDB repository."""
+        if self._duckdb_repo is None:
+            self._duckdb_repo = get_duckdb_repository()
+        return self._duckdb_repo
     
     def import_from_dataframe(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
@@ -110,6 +129,19 @@ class CampaignService:
             # Create a DF from the parsed data to easily sum
             parsed_df = pd.DataFrame(campaigns_data)
             
+            # Sync to DuckDB/Parquet for Analytics
+            try:
+                duckdb_mgr = get_duckdb_manager()
+                duckdb_mgr.append_campaigns(parsed_df)
+                logger.info(f"Synced {len(parsed_df)} rows to DuckDB")
+            except Exception as e:
+                logger.error(f"Failed to sync to DuckDB: {e}")
+                # Don't fail the SQL import just because DuckDB failed, but log it.
+                # Or should we fail? Better to fail to force retry?
+                # For now, let's log error but allow SQL success, 
+                # as the user can re-import or manual sync might be added later.
+                pass
+            
             summary = {
                 "total_spend": float(parsed_df['spend'].sum()) if not parsed_df.empty else 0,
                 "total_clicks": int(parsed_df['clicks'].sum()) if not parsed_df.empty else 0,
@@ -132,10 +164,18 @@ class CampaignService:
             pass # Preview generation kept same
             preview = df.head(5).where(pd.notnull(df), None).to_dict(orient='records')
 
+            # Clear agent workflow cache ensuring fresh context for new data
+            try:
+                from src.agents.agent_chain import clear_workflow_state
+                clear_workflow_state()
+                logger.info("Cleared agent workflow cache after data import")
+            except Exception as e:
+                logger.warning(f"Failed to clear workflow cache: {e}")
+
             return {
                 'success': True,
                 'imported_count': len(campaigns),
-                'message': f'Successfully imported {len(campaigns)} campaigns',
+                'message': f'Successfully imported {len(campaigns)} rows',
                 'summary': summary,
                 'schema': schema_info,
                 'preview': preview
@@ -494,3 +534,210 @@ class CampaignService:
         c.end_date = datetime.now()
         c.created_at = datetime.now()
         return c
+
+    # ========================================================================
+    # ANALYTICS METHODS (DuckDB-based)
+    # ========================================================================
+    
+    def get_dashboard_stats(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        platforms: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """
+        Get comprehensive dashboard statistics.
+        
+        Returns:
+            Dictionary with current metrics, comparison, sparklines
+        """
+        # Get current period metrics
+        current_totals = self.duckdb_repo.get_total_metrics(
+            start_date=start_date,
+            end_date=end_date,
+            platforms=platforms
+        )
+        
+        current_metrics = calculate_all_metrics(
+            spend=current_totals.get('spend', 0),
+            impressions=current_totals.get('impressions', 0),
+            clicks=current_totals.get('clicks', 0),
+            conversions=current_totals.get('conversions', 0),
+            revenue=current_totals.get('revenue', 0)
+        )
+        
+        # Calculate previous period comparison
+        comparison = {}
+        if start_date and end_date:
+            try:
+                start = datetime.strptime(start_date, "%Y-%m-%d")
+                end = datetime.strptime(end_date, "%Y-%m-%d")
+                period_days = (end - start).days
+                
+                prev_end = start - timedelta(days=1)
+                prev_start = prev_end - timedelta(days=period_days)
+                
+                prev_totals = self.duckdb_repo.get_total_metrics(
+                    start_date=prev_start.strftime("%Y-%m-%d"),
+                    end_date=prev_end.strftime("%Y-%m-%d"),
+                    platforms=platforms
+                )
+                
+                prev_metrics = calculate_all_metrics(
+                    spend=prev_totals.get('spend', 0),
+                    impressions=prev_totals.get('impressions', 0),
+                    clicks=prev_totals.get('clicks', 0),
+                    conversions=prev_totals.get('conversions', 0),
+                    revenue=prev_totals.get('revenue', 0)
+                )
+                
+                for key in ['spend', 'impressions', 'clicks', 'conversions', 'ctr', 'roas']:
+                    comparison[f"{key}_change"] = round(
+                        calculate_percentage_change(
+                            current_metrics.get(key, 0),
+                            prev_metrics.get(key, 0)
+                        ), 1
+                    )
+            except Exception as e:
+                logger.warning(f"Could not calculate comparison: {e}")
+        
+        # Get sparklines (last 7 data points)
+        sparklines = {}
+        for metric in ['spend', 'clicks', 'conversions']:
+            try:
+                ts_df = self.duckdb_repo.get_time_series(
+                    metric=metric,
+                    granularity='daily',
+                    start_date=start_date,
+                    end_date=end_date
+                )
+                if not ts_df.empty:
+                    sparklines[metric] = ts_df['value'].tolist()[-7:]
+            except Exception:
+                pass
+        
+        return {
+            "current": current_metrics,
+            "comparison": comparison,
+            "sparklines": sparklines,
+            "date_range": {"start": start_date, "end": end_date}
+        }
+    
+    def get_visualizations_data(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        platforms: Optional[List[str]] = None,
+        group_by: str = "Platform"
+    ) -> Dict[str, Any]:
+        """
+        Get visualization data for charts.
+        
+        Returns:
+            Dictionary with platform breakdown, channel breakdown, time series
+        """
+        # Platform breakdown
+        platform_df = self.duckdb_repo.get_aggregated_metrics(
+            group_by="Platform",
+            start_date=start_date,
+            end_date=end_date,
+            platforms=platforms
+        )
+        
+        platform_data = []
+        for _, row in platform_df.iterrows():
+            metrics = calculate_all_metrics(
+                spend=row.get('spend', 0),
+                impressions=row.get('impressions', 0),
+                clicks=row.get('clicks', 0),
+                conversions=row.get('conversions', 0),
+                revenue=row.get('revenue', 0)
+            )
+            metrics['name'] = row.get('dimension', 'Unknown')
+            platform_data.append(metrics)
+        
+        # Channel breakdown
+        channel_data = []
+        try:
+            channel_df = self.duckdb_repo.get_aggregated_metrics(
+                group_by="Channel",
+                start_date=start_date,
+                end_date=end_date,
+                platforms=platforms
+            )
+            for _, row in channel_df.iterrows():
+                metrics = calculate_all_metrics(
+                    spend=row.get('spend', 0),
+                    impressions=row.get('impressions', 0),
+                    clicks=row.get('clicks', 0),
+                    conversions=row.get('conversions', 0),
+                    revenue=row.get('revenue', 0)
+                )
+                metrics['name'] = row.get('dimension', 'Unknown')
+                channel_data.append(metrics)
+        except Exception:
+            pass
+        
+        # Time series
+        time_series = {}
+        for metric in ['spend', 'clicks', 'conversions']:
+            try:
+                ts_df = self.duckdb_repo.get_time_series(
+                    metric=metric,
+                    granularity='daily',
+                    start_date=start_date,
+                    end_date=end_date,
+                    platforms=platforms
+                )
+                if not ts_df.empty:
+                    time_series[metric] = ts_df.to_dict('records')
+            except Exception:
+                pass
+        
+        return {
+            "by_platform": platform_data,
+            "by_channel": channel_data,
+            "time_series": time_series
+        }
+    
+    def get_dimension_breakdown(
+        self,
+        dimension: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """
+        Get breakdown by any dimension (funnel, device, age, etc.)
+        """
+        try:
+            df = self.duckdb_repo.get_aggregated_metrics(
+                group_by=dimension.capitalize(),
+                start_date=start_date,
+                end_date=end_date
+            )
+            
+            results = []
+            for _, row in df.head(limit).iterrows():
+                metrics = calculate_all_metrics(
+                    spend=row.get('spend', 0),
+                    impressions=row.get('impressions', 0),
+                    clicks=row.get('clicks', 0),
+                    conversions=row.get('conversions', 0),
+                    revenue=row.get('revenue', 0)
+                )
+                metrics['name'] = row.get('dimension', 'Unknown')
+                results.append(metrics)
+            
+            return results
+        except Exception as e:
+            logger.error(f"Failed to get {dimension} breakdown: {e}")
+            return []
+    
+    def get_schema_info(self) -> Dict[str, Any]:
+        """Get schema metadata about available columns."""
+        return self.duckdb_repo.get_schema_info()
+    
+    def get_filter_options(self) -> Dict[str, List[str]]:
+        """Get all unique filter option values for dropdowns."""
+        return self.duckdb_repo.get_filter_options()

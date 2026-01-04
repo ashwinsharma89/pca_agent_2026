@@ -155,6 +155,17 @@ class OpenTelemetryConfig:
             if self.instrument_requests:
                 RequestsInstrumentor().instrument()
                 logger.info("Requests library instrumented with OpenTelemetry")
+
+            # Instrument LangChain (Manually added for Phase 4)
+            # This captures LangGraph execution steps as spans
+            try:
+                from opentelemetry.instrumentation.langchain import LangChainInstrumentor
+                LangChainInstrumentor().instrument()
+                logger.info("LangChain/LangGraph instrumented with OpenTelemetry")
+            except ImportError:
+                logger.warning("opentelemetry-instrumentation-langchain not installed. Agent tracing disabled.")
+            except Exception as e:
+                logger.warning(f"Failed to instrument LangChain: {e}")
             
             logger.info("OpenTelemetry instrumentation complete")
             

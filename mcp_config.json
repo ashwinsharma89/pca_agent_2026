@@ -1,0 +1,15 @@
+{
+    "mcpServers": {
+        "pca-nl-to-sql": {
+            "command": "python",
+            "args": [
+                "-m",
+                "src.mcp_server.nl_to_sql_server"
+            ],
+            "cwd": "/Users/ashwin/Desktop/pca_agent copy",
+            "env": {
+                "OPENAI_API_KEY": "${OPENAI_API_KEY}"
+            }
+        }
+    }
+}

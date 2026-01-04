@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List
 import time
 import logging
+from pydantic import ValidationError
+from fastapi.exceptions import RequestValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +87,16 @@ class APIGateway:
                 
                 return response
                 
+            except (ValidationError, RequestValidationError) as e:
+                logger.warning(f"Validation error: {e}")
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "error": "Validation Error",
+                        "code": "VALIDATION_ERROR",
+                        "details": str(e)
+                    }
+                )
             except Exception as e:
                 logger.error(f"Gateway error: {e}", exc_info=True)
                 return JSONResponse(

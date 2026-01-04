@@ -21,6 +21,7 @@ class DatabaseConnector:
         'sqlite': 'SQLite',
         'mssql': 'SQL Server',
         'oracle': 'Oracle',
+        'supabase': 'Supabase',
         
         # Modern Data Warehouses
         'duckdb': 'DuckDB',
@@ -69,8 +70,12 @@ class DatabaseConnector:
         """
         db_type = db_type.lower()
         
-        if db_type not in self.SUPPORTED_DATABASES:
-            raise ValueError(f"Unsupported database type: {db_type}. Supported: {list(self.SUPPORTED_DATABASES.keys())}")
+        if db_type not in self.SUPPORTED_DATABASES and db_type != 'postgresql': # Handle aliased
+             # Re-check if it was original key
+             if db_type == 'postgresql' and 'supabase' in self.SUPPORTED_DATABASES:
+                 pass
+             else:
+                raise ValueError(f"Unsupported database type: {db_type}. Supported: {list(self.SUPPORTED_DATABASES.keys())}")
         
         # SQLite
         if db_type == 'sqlite':
@@ -160,6 +165,12 @@ class DatabaseConnector:
                 raise ValueError("Databricks requires 'http_path' parameter")
             
             return f"databricks://token:{token}@{host}?http_path={http_path}&catalog={database}"
+            
+        # Supabase (PostgreSQL with forced SSL)
+        elif db_type == 'supabase':
+            port = port or 5432
+            # Supabase requires SSL - Use explicit driver to match debug script success
+            return f"postgresql+psycopg2://{username}:{encoded_password}@{host}:{port}/{database}?sslmode=require"
         
         return None
     
@@ -183,12 +194,36 @@ class DatabaseConnector:
         try:
             if connection_string:
                 self.connection_string = connection_string
+                # Auto-fix Supabase SSL & Encoding
+                if 'supabase.co' in self.connection_string:
+                    try:
+                        from sqlalchemy.engine.url import make_url
+                        u = make_url(self.connection_string)
+                        
+                        # Apply SSL
+                        query = u.query.copy()
+                        query['sslmode'] = 'require'
+                        u = u._replace(query=query)
+                        
+                        # Ensure driver is specified if missing
+                        if u.drivername == 'postgresql':
+                             u = u._replace(drivername='postgresql+psycopg2')
+                        
+                        # Force re-render which handles encoding
+                        self.connection_string = u.render_as_string(hide_password=False)
+                        
+                        logger.info(f"Fixed Supabase connection string: {u.render_as_string(hide_password=True)}")
+                    except Exception as e:
+                        logger.warning(f"Failed to auto-fix Supabase string: {e}")
+
             elif db_type:
                 self.connection_string = self.build_connection_string(db_type, **kwargs)
             else:
                 raise ValueError("Either connection_string or db_type must be provided")
             
             logger.info(f"Connecting to database...")
+            
+            # Simple create_engine, relying on the robust string we built
             self.engine = create_engine(self.connection_string)
             
             # Test connection
@@ -199,9 +234,19 @@ class DatabaseConnector:
             return True
             
         except Exception as e:
+            # Redact password for safe logging
+            safe_conn_str = "REDACTED"
+            if self.connection_string:
+                try:
+                    from sqlalchemy.engine.url import make_url
+                    safe_conn_str = make_url(self.connection_string).render_as_string(hide_password=True)
+                except:
+                    pass
+            
             logger.error(f"❌ Database connection failed: {e}")
             self.engine = None
-            raise
+            # Re-raise with safe string for UI
+            raise Exception(f"Connection failed to {safe_conn_str}. Error: {str(e)}")
     
     def get_tables(self) -> List[str]:
         """
@@ -294,7 +339,7 @@ class DatabaseConnector:
         Returns:
             DataFrame with table data
         """
-        query = f"SELECT * FROM {table_name}"  # nosec B608
+        query = f'SELECT * FROM "{table_name}"'  # nosec B608
         if limit:
             query += f" LIMIT {limit}"
         

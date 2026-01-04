@@ -9,7 +9,11 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 import os
 
+
+import pybreaker
 from loguru import logger
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import requests
 
 from src.connectors.base_connector import (
     BaseAdConnector,
@@ -74,6 +78,10 @@ class AdConnectorManager:
         self.use_mock = use_mock
         self._connectors: Dict[str, BaseAdConnector] = {}
         
+        # Phase 1 Step 2: Circuit Breakers (One per platform)
+        # Default: 5 failures trips it, 60s reset timeout
+        self.circuit_breakers: Dict[str, pybreaker.CircuitBreaker] = {}
+        
         # Initialize requested platforms
         platforms = platforms or list(self.SUPPORTED_PLATFORMS.keys())
         for platform in platforms:
@@ -88,6 +96,58 @@ class AdConnectorManager:
             mock_mode=use_mock,
         )
     
+    
+    def _get_breaker(self, platform: str) -> pybreaker.CircuitBreaker:
+        """Get or create a circuit breaker for the platform."""
+        if platform not in self.circuit_breakers:
+            # Create a new breaker for this platform
+            # fail_max=5: 5 consecutive failures opens the circuit
+            # reset_timeout=60: Wait 60s before trying again (Half-Open)
+            self.circuit_breakers[platform] = pybreaker.CircuitBreaker(
+                fail_max=5, 
+                reset_timeout=60,
+                name=f"{platform}_breaker"
+            )
+        return self.circuit_breakers[platform]
+
+    def _call_with_retry(self, platform: str, func, *args, **kwargs):
+        """
+        Call a connector function with retry and circuit breaker protection.
+        
+        Retries up to 3 times with exponential backoff (1s, 2s, 4s) for transient errors.
+        Circuit breaker opens after 5 consecutive failures.
+        
+        Args:
+            platform: Platform name for logging and breaker lookup.
+            func: The function to call.
+            *args, **kwargs: Arguments to pass to the function.
+            
+        Returns:
+            Result from the function call.
+            
+        Raises:
+            pybreaker.CircuitBreakerError: If the circuit is open.
+            Exception: If all retries are exhausted.
+        """
+        breaker = self._get_breaker(platform)
+        
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=1, max=10),
+            retry=retry_if_exception_type((
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                ConnectionResetError,
+            )),
+            before_sleep=lambda retry_state: logger.warning(
+                f"Retry {retry_state.attempt_number}/3 for {platform} after {retry_state.outcome.exception()}"
+            )
+        )
+        def _inner():
+            return breaker.call(func, *args, **kwargs)
+        
+        return _inner()
+
     def get_connector(self, platform: str) -> Optional[BaseAdConnector]:
         """Get a specific connector by platform name."""
         return self._connectors.get(platform)
@@ -104,7 +164,26 @@ class AdConnectorManager:
                 error_details=f"Supported platforms: {list(self.SUPPORTED_PLATFORMS.keys())}",
             )
         
-        return connector.test_connection()
+        try:
+            return self._call_with_retry(platform, connector.test_connection)
+        except pybreaker.CircuitBreakerError:
+            logger.error(f"Circuit Breaker OPEN for {platform}. Skipping connection test.")
+            return ConnectionResult(
+                success=False,
+                status=ConnectorStatus.ERROR,
+                message=f"Circuit Breaker OPEN for {platform}",
+                platform=platform,
+                error_details="Too many recent failures. Circuit is open to prevent cascading failure."
+            )
+        except Exception as e:
+            # Let the breaker count this as a failure, but we also return a failed result
+            logger.error(f"Connection test failed for {platform}: {e}")
+            return ConnectionResult(
+                success=False,
+                status=ConnectorStatus.ERROR,
+                message=str(e),
+                platform=platform
+            )
     
     def test_all_connections(self) -> Dict[str, ConnectionResult]:
         """Test connections for all configured platforms."""
@@ -153,7 +232,10 @@ class AdConnectorManager:
             connector = self._connectors.get(platform)
             if connector:
                 try:
-                    campaigns[platform] = connector.get_campaigns(start_date, end_date)
+                    campaigns[platform] = self._call_with_retry(platform, connector.get_campaigns, start_date, end_date)
+                except pybreaker.CircuitBreakerError:
+                    logger.warning(f"Circuit Breaker OPEN for {platform}. Skipping campaigns fetch.")
+                    campaigns[platform] = []
                 except Exception as e:
                     logger.error(f"Failed to get campaigns from {platform}: {e}")
                     campaigns[platform] = []
@@ -207,7 +289,9 @@ class AdConnectorManager:
             connector = self._connectors.get(platform)
             if connector:
                 try:
-                    performance[platform] = connector.get_performance(start_date, end_date)
+                    performance[platform] = self._call_with_retry(platform, connector.get_performance, start_date, end_date)
+                except pybreaker.CircuitBreakerError:
+                    logger.warning(f"Circuit Breaker OPEN for {platform}. Skipping performance fetch.")
                 except Exception as e:
                     logger.error(f"Failed to get performance from {platform}: {e}")
         

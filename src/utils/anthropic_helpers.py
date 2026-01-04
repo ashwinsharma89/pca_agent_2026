@@ -76,3 +76,43 @@ def create_async_anthropic_client(api_key: Optional[str] = None):
     except Exception as exc:  # pragma: no cover - environment specific
         _log_client_error(exc)
         return None
+
+
+def call_anthropic_http(api_key: str, model: str, messages: list, max_tokens: int = 4000) -> dict:
+    """
+    Make a raw HTTP request to Anthropic API to bypass SDK/Proxy issues.
+    """
+    import requests
+    import json
+    
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+    
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": messages
+    }
+    
+    try:
+        logger.info(f"Anthropic HTTP call - Model: {model}, API Key (prefix): {api_key[:12]}...")
+        response = requests.post(url, headers=headers, json=payload, timeout=180)  # 3 min for Sonnet 4.5
+        response.raise_for_status()
+        
+        data = response.json()
+        content = data['content'][0]['text']
+        usage = data.get('usage', {})
+        
+        return {
+            'content': content,
+            'usage': usage
+        }
+    except Exception as e:
+        logger.error(f"Raw Anthropic HTTP call failed: {e}")
+        if hasattr(e, 'response') and e.response:
+             logger.error(f"Response: {e.response.text}")
+        raise e

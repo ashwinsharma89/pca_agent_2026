@@ -8,7 +8,7 @@ echo "🚀 Starting PCA Agent Services..."
 
 # 1. Start Backend API in background
 echo "Starting Backend API..."
-source venv/bin/activate
+source .venv312/bin/activate
 # Run in background and redirect output to backend.log
 python3 -m src.api.main > backend.log 2>&1 &
 BACKEND_PID=$!

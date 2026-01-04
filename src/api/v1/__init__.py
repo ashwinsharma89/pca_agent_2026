@@ -15,12 +15,9 @@ from .user_management import router as user_management_router
 from .api_keys import router as api_keys_router
 from .webhooks import router as webhooks_router
 from .intelligence import router as intelligence_router
-from .anomaly import router as anomaly_router
-from .realtime import router as realtime_router
 from .dashboards import router as dashboards_router
-from .comparison import router as comparison_router
-from .pacing_reports import router as pacing_reports_router
 from .connectors import router as connectors_router
+from .health_check import router as health_check_router
 
 router_v1.include_router(auth_router)
 router_v1.include_router(campaigns_router)
@@ -28,12 +25,19 @@ router_v1.include_router(user_management_router)
 router_v1.include_router(api_keys_router)
 router_v1.include_router(webhooks_router)
 router_v1.include_router(intelligence_router)
-router_v1.include_router(anomaly_router)
-router_v1.include_router(realtime_router)
 router_v1.include_router(dashboards_router)
-router_v1.include_router(comparison_router)
-router_v1.include_router(pacing_reports_router)
 router_v1.include_router(connectors_router)
+router_v1.include_router(health_check_router)
+
+from .databases import router as databases_router
+router_v1.include_router(databases_router)
+
+from .upload import router as upload_router
+router_v1.include_router(upload_router)
+
+from .orchestrator import router as orchestrator_router
+router_v1.include_router(orchestrator_router)
+
 
 __all__ = ['router_v1']
 

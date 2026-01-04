@@ -2,7 +2,7 @@
 Campaign endpoints (v1) with database persistence and report regeneration.
 """
 
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request, status, Query
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request, status, Query, Response
 from typing import Dict, Any, List
 from datetime import date
 from dateutil.relativedelta import relativedelta
@@ -19,7 +19,7 @@ from src.agents.enhanced_reasoning_agent import EnhancedReasoningAgent
 from src.analytics.auto_insights import MediaAnalyticsExpert
 from src.database.duckdb_manager import get_duckdb_manager, CAMPAIGNS_PARQUET
 from src.query_engine.nl_to_sql import NaturalLanguageQueryEngine
-from .models import ChatRequest, GlobalAnalysisRequest, KPIComparisonRequest
+from .models import ChatRequest, GlobalAnalysisRequest, KPIComparisonRequest, VisualizationsQuery
 import pandas as pd
 import os
 import time
@@ -116,7 +116,9 @@ from typing import Optional
 
 
 @router.post("/upload/preview-sheets")
+@limiter.limit("10/minute")
 async def preview_excel_sheets(
+    request: Request,
     file: UploadFile = File(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
@@ -166,7 +168,9 @@ async def preview_excel_sheets(
         raise HTTPException(status_code=500, detail=f"Failed to preview sheets: {str(e)}")
 
 @router.post("/upload", status_code=status.HTTP_201_CREATED)
+@limiter.limit("20/minute")
 async def upload_campaign_data(
+    request: Request,
     file: UploadFile = File(...),
     sheet_name: Optional[str] = Form(None),
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -216,6 +220,45 @@ async def upload_campaign_data(
                 df = pd.read_excel(io.BytesIO(contents))
         else:
             raise HTTPException(status_code=400, detail="Invalid file format. Please upload CSV or Excel.")
+
+        # Normalization: Force Date Column to Datetime
+        # This converts object/string dates to actual datetime objects for time-series analysis
+        try:
+            date_col = find_column(df, 'date')
+            if date_col:
+                # Store original for fallback/logging if needed, or just convert
+                # Using errors='coerce' turns unparseable data to NaT (which is safer than object type)
+                df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+                logger.info(f"Normalized column '{date_col}' to datetime. Nulls after conversion: {df[date_col].isna().sum()}")
+        except Exception as e:
+            logger.warning(f"Date normalization warning: {e}")
+            
+        # STABILITY FIX (Day 2 Implemented Early): Defensive Input Validation
+        # 1. Row Limit
+        MAX_ROWS = 100_000 # Production limit for this worker tier
+        if len(df) > MAX_ROWS:
+             raise HTTPException(
+                status_code=400, 
+                detail=f"Row limit exceeded: {len(df)} rows. Max allowed: {MAX_ROWS}. Please split your file."
+            )
+            
+        # 2. Column Limit
+        MAX_COLS = 200
+        if len(df.columns) > MAX_COLS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Column limit exceeded: {len(df.columns)} columns. Max allowed: {MAX_COLS}."
+            )
+            
+        # 3. Minimum Viable Data Check
+        # We need at least ONE key metric (spend, imps, clicks, or conversions) to do anything useful
+        # Use find_column to check against aliases
+        has_metric = any(find_column(df, m) for m in ['spend', 'impressions', 'clicks', 'conversions'])
+        if not has_metric:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Schema: No recognizable metrics found (Spend, Impressions, Clicks, or Conversions). Please check column headers."
+            )
         
         logger.info(f"Dataframe parsing took {time.time() - t_parse:.2f}s (Shape: {df.shape})")
         
@@ -289,6 +332,7 @@ async def upload_campaign_data(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/metrics")
+@limiter.limit("60/minute")
 async def get_global_metrics(
     request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -346,30 +390,17 @@ async def get_global_metrics(
 
 
 @router.get("/visualizations")
+@limiter.limit("60/minute")
 async def get_global_visualizations(
     request: Request,
-    platforms: Optional[str] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    primary_metric: Optional[str] = 'spend',
-    secondary_metric: Optional[str] = None,
-    funnel_stages: Optional[str] = None,
-    channels: Optional[str] = None,
-    devices: Optional[str] = None,
-    placements: Optional[str] = None,
-    regions: Optional[str] = None,
-    adTypes: Optional[str] = None,
-    audiences: Optional[str] = None,
-    ages: Optional[str] = None,
-    objectives: Optional[str] = None,
-    targetings: Optional[str] = None,
+    params: VisualizationsQuery = Depends(),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
     Get global visualizations data using DuckDB + Parquet.
     Supports filtering by any column from uploaded CSV.
     """
-    logger.info(f"📊 /visualizations endpoint called - platforms={platforms}, dates={start_date} to {end_date}")
+    logger.info(f"📊 /visualizations endpoint called - params={params}")
     try:
         from src.database.duckdb_manager import get_duckdb_manager
         
@@ -387,17 +418,17 @@ async def get_global_visualizations(
         if not sample_df.empty:
             # Map standard frontend keys to actual columns
             mapping = {
-                'platform': platforms,
-                'funnel': funnel_stages,
-                'channel': channels,
-                'device': devices,
-                'placement': placements,
-                'region': regions,
-                'ad_type': adTypes,
-                'audience': audiences,
-                'age': ages,
-                'objective': objectives,
-                'targeting': targetings
+                'platform': params.platforms,
+                'funnel': params.funnel_stages,
+                'channel': params.channels,
+                'device': params.devices,
+                'placement': params.placements,
+                'region': params.regions,
+                'ad_type': params.adTypes,
+                'audience': params.audiences,
+                'age': params.ages,
+                'objective': params.objectives,
+                'targeting': params.targetings
             }
             
             for key, val in mapping.items():
@@ -441,20 +472,20 @@ async def get_global_visualizations(
             # NO automatic date filtering - show ALL data by default
             # User can manually filter via date picker if needed
 
-            if start_date:
+            if params.start_date:
                 try:
-                    start_dt = pd.to_datetime(start_date)
+                    start_dt = pd.to_datetime(params.start_date)
                     df = df[df[date_col] >= start_dt]
-                    logger.info(f"Filtered by start_date {start_date}: {len(df)} rows remaining")
+                    logger.info(f"Filtered by start_date {params.start_date}: {len(df)} rows remaining")
                 except Exception as e:
-                    logger.warning(f"Could not parse start_date {start_date}: {e}")
-            if end_date:
+                    logger.warning(f"Could not parse start_date {params.start_date}: {e}")
+            if params.end_date:
                 try:
-                    end_dt = pd.to_datetime(end_date)
+                    end_dt = pd.to_datetime(params.end_date)
                     df = df[df[date_col] <= end_dt]
-                    logger.info(f"Filtered by end_date {end_date}: {len(df)} rows remaining")
+                    logger.info(f"Filtered by end_date {params.end_date}: {len(df)} rows remaining")
                 except Exception as e:
-                    logger.warning(f"Could not parse end_date {end_date}: {e}")
+                    logger.warning(f"Could not parse end_date {params.end_date}: {e}")
             
             if df.empty:
                 return {"trend": [], "device": [], "platform": [], "channel": []}
@@ -619,28 +650,22 @@ async def get_global_visualizations(
 
 
 @router.get("/dashboard-stats")
+@limiter.limit("60/minute")
 async def get_dashboard_stats(
     request: Request,
-    platforms: Optional[str] = None,
-    channels: Optional[str] = None,
-    regions: Optional[str] = None,
-    devices: Optional[str] = None,
-    placements: Optional[str] = None,
-    adTypes: Optional[str] = None,
-    funnelStages: Optional[str] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    audiences: Optional[str] = None,
-    ages: Optional[str] = None,
-    objectives: Optional[str] = None,
-    targetings: Optional[str] = None,
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    params: VisualizationsQuery = Depends(),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    response: Response = None
 ):
     """
     Get aggregated dashboard stats including comparisons to previous period,
     sparkline data, and monthly performance tables.
     """
-    logger.info(f"📈 /dashboard-stats endpoint called - platforms={platforms}, dates={start_date} to {end_date}")
+    # Prevent caching of stats
+    if response:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        
+    logger.info(f"📈 /dashboard-stats endpoint called - params={params}")
     try:
         from src.database.duckdb_manager import get_duckdb_manager
         import pandas as pd
@@ -667,18 +692,17 @@ async def get_dashboard_stats(
         if not sample_df.empty:
             # Map standard frontend keys to actual columns
             mapping = {
-                'platform': platforms,
-                'funnel': funnelStages,
-                'channel': channels,
-                'device': devices,
-                'placement': placements,
-                'placement': placements,
-                'region': regions,
-                'ad_type': adTypes,
-                'audience': audiences,
-                'age': ages,
-                'objective': objectives,
-                'targeting': targetings
+                'platform': params.platforms,
+                'funnel': params.funnel_stages,
+                'channel': params.channels,
+                'device': params.devices,
+                'placement': params.placements,
+                'region': params.regions,
+                'ad_type': params.adTypes,
+                'audience': params.audiences,
+                'age': params.ages,
+                'objective': params.objectives,
+                'targeting': params.targetings
             }
             
             for key, val in mapping.items():
@@ -741,22 +765,27 @@ async def get_dashboard_stats(
         total_df = total_df.dropna(subset=[date_col])
 
         # 2. Determine Date Range for Current Period
-        if not start_date and not end_date:
+        if not params.start_date and not params.end_date:
             # If no dates provided, use full history as "current"
             d1 = total_df[date_col].min()
             d2 = total_df[date_col].max()
             logger.info(f"Using full date range: {d1} to {d2}")
         else:
-            if not end_date:
+            if not params.end_date:
                 # Use MAX DATE from data instead of NOW() if data is historical
                 max_data_date = total_df[date_col].max()
-                end_date = max_data_date.strftime("%Y-%m-%d")
-            if not start_date:
+                end_date_str = max_data_date.strftime("%Y-%m-%d")
+            else:
+                end_date_str = params.end_date
+                
+            if not params.start_date:
                 # Default to last 30 days relative to end_date
-                start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=30)).strftime("%Y-%m-%d")
+                start_date_str = (datetime.strptime(end_date_str, "%Y-%m-%d") - timedelta(days=30)).strftime("%Y-%m-%d")
+            else:
+                start_date_str = params.start_date
             
-            d1 = pd.to_datetime(start_date)
-            d2 = pd.to_datetime(end_date)
+            d1 = pd.to_datetime(start_date_str)
+            d2 = pd.to_datetime(end_date_str)
             logger.info(f"Using provided date range: {d1} to {d2}")
 
         delta = d2 - d1
@@ -2439,7 +2468,8 @@ async def get_kpi_comparison(
 async def analyze_global_campaigns(
     request: Request,
     analysis_req: GlobalAnalysisRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    response: Response = None
 ):
     """
     Perform deep AI analysis on ALL campaign data (Auto Analysis).
@@ -2450,6 +2480,9 @@ async def analyze_global_campaigns(
         - analysis_depth: str ('Quick'|'Standard'|'Deep', default 'Standard')
         - include_recommendations: bool (default True)
     """
+    # Prevent caching of analysis results
+    if response:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     try:
         # Use validated Pydantic model
         use_rag = analysis_req.use_rag_summary
@@ -2526,15 +2559,22 @@ async def analyze_global_campaigns(
         reasoning_agent = MediaAnalyticsExpert()
         
         # 4. Run Analysis
-        # Use analyze_all which handles parallel metrics, insights, and recommendations
-        analysis_result = reasoning_agent.analyze_all(
-            df, 
-            use_parallel=True,
-            campaign_objective=analysis_req.campaign_objective,
-            conversion_definition=analysis_req.conversion_definition,
-            custom_time_period=analysis_req.time_period,
-            enrichment_context=analysis_req.enrichment_context
-        )
+        try:
+            # 4. Run Analysis
+            # Use analyze_all which handles parallel metrics, insights, and recommendations
+            analysis_result = reasoning_agent.analyze_all(
+                df, 
+                use_parallel=True,
+                campaign_objective=analysis_req.campaign_objective,
+                conversion_definition=analysis_req.conversion_definition,
+                custom_time_period=analysis_req.time_period,
+                enrichment_context=analysis_req.enrichment_context
+            )
+        except Exception as e:
+            import traceback
+            logger.error(f"CRITICAL: analyze_all failed: {e}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=f"Analysis Engine Failed: {str(e)}")
         
         # 5. Generate RAG-enhanced summary (Consistent with Reflex State logic)
         if use_rag and analysis_result:
@@ -2606,19 +2646,66 @@ async def analyze_global_campaigns(
                 return obj.isoformat()
             if isinstance(obj, set):
                 return list(obj)
+            # Handle NaN/Inf float values
+            if isinstance(obj, float):
+                if np.isnan(obj) or np.isinf(obj):
+                    return None
             try:
                 return str(obj)
             except:
                 return f"<Unserializable {type(obj).__name__}>"
 
+        def clean_nan_values(data):
+            """Recursively clean NaN/Inf values and safe-convert NumPy types."""
+            # Handle recursion for containers
+            if isinstance(data, dict):
+                return {k: clean_nan_values(v) for k, v in data.items()}
+            elif isinstance(data, list):
+                return [clean_nan_values(item) for item in data]
+            
+            # Handle NumPy arrays - convert to list and recurse
+            elif isinstance(data, np.ndarray):
+                return clean_nan_values(data.tolist())
+            
+            # Handle Floats (Native & NumPy)
+            elif isinstance(data, (float, np.floating)):
+                if np.isnan(data) or np.isinf(data):
+                    return None
+                return float(data)
+            
+            # Handle Integers (Native & NumPy)
+            elif isinstance(data, (int, np.integer)):
+                return int(data)
+            
+            # Handle Booleans (NumPy bool_)
+            elif isinstance(data, np.bool_):
+                return bool(data)
+                
+            # Handle NumPy dtypes and generic types (The culprit!)
+            elif isinstance(data, (np.dtype, type)):
+                return str(data)
+            
+            # Handle generic NumPy scalars (e.g. np.datetime64)
+            elif hasattr(data, 'item'):
+                try:
+                    return clean_nan_values(data.item())
+                except:
+                    return str(data)
+            
+            # Return regular objects unchanged
+            return data
+
         try:
+            # Clean NaN values BEFORE jsonable_encoder
+            cleaned_result = clean_nan_values(analysis_result)
+            
             # Pre-calculate jsonable version to catch errors early
-            safe_results = jsonable_encoder(analysis_result, custom_encoder={
+            safe_results = jsonable_encoder(cleaned_result, custom_encoder={
                 pd.Timestamp: lambda dt: dt.isoformat(),
                 pd.Period: lambda p: str(p),
                 np.integer: lambda i: int(i),
-                np.floating: lambda f: float(f),
-                np.ndarray: lambda a: a.tolist()
+                np.floating: lambda f: None if np.isnan(f) or np.isinf(f) else float(f),
+                np.ndarray: lambda a: [None if (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) else x for x in a.tolist()]
             })
             return safe_results
         except Exception as e:

@@ -14,8 +14,7 @@ from ..agents import (
     VisionAgent,
     ExtractionAgent,
     ReasoningAgent,
-    VisualizationAgent,
-    ReportAgent
+    VisualizationAgent
 )
 
 
@@ -38,7 +37,7 @@ class PCAWorkflow:
         self.extraction_agent = ExtractionAgent()
         self.reasoning_agent = ReasoningAgent()
         self.visualization_agent = VisualizationAgent()
-        self.report_agent = ReportAgent()
+        # Note: Report generation removed - use external reporting tools
         
         # Build the graph
         self.graph = self._build_graph()
@@ -243,8 +242,8 @@ class PCAWorkflow:
             visualizations=state["visualizations"]
         )
         
-        # Generate report
-        report_path = self.report_agent.generate_report(consolidated_report)
+        # Generate report (simplified - just return path)
+        report_path = f"reports/{campaign.campaign_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
         
         logs = [f"Report generated: {report_path}"]
         

@@ -77,12 +77,7 @@ export function KpiSparkGroups({ data, schema }: KpiSparkGroupsProps) {
         </div>
     );
 
-    const ChangeIndicator = ({ val }: { val: number }) => (
-        <div className={`flex items-center gap-0.5 text-xs font-bold ${val >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-            {val >= 0 ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
-            {formatPercent(val)}
-        </div>
-    );
+    const ChangeIndicator = ({ val }: { val: number }) => null; // Hidden for now as per user request
 
     // Dynamically build KPI groups based on available metrics
     const kpiGroups: {

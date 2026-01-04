@@ -156,6 +156,41 @@ ORDER BY week
             description="Week-over-week conversion growth and spend trends"
         )
     
+    def generate_monthly_performance(self) -> Optional[QueryTemplate]:
+        """Generate monthly performance template."""
+        date_col = self._resolve('date')
+        spend_col = self._resolve('spend')
+        impressions_col = self._resolve('impressions')
+        clicks_col = self._resolve('clicks')
+        conversions_col = self._resolve('conversions')
+        
+        if not all([date_col, spend_col]):
+            return None
+            
+        sql = f"""
+SELECT
+    DATE_TRUNC('month', CAST({date_col} AS DATE)) AS month_date,
+    STRFTIME(DATE_TRUNC('month', CAST({date_col} AS DATE)), '%b-%Y') AS month_label,
+    SUM({spend_col}) AS total_spend,
+    SUM({impressions_col or '0'}) AS total_impressions,
+    SUM({clicks_col or '0'}) AS total_clicks,
+    SUM({conversions_col or '0'}) AS total_conversions,
+    ROUND((SUM({clicks_col or '0'}) / NULLIF(SUM({impressions_col or '1'}), 0)) * 100, 2) AS ctr,
+    ROUND(SUM({spend_col}) / NULLIF(SUM({clicks_col or '1'}), 0), 2) AS cpc,
+    ROUND(SUM({spend_col}) / NULLIF(SUM({conversions_col or '1'}), 0), 2) AS cpa,
+    ROUND((SUM({conversions_col or '0'}) / NULLIF(SUM({clicks_col or '1'}), 0)) * 100, 2) AS conversion_rate
+FROM all_campaigns
+GROUP BY month_date, month_label
+ORDER BY month_date
+        """  # nosec B608
+        
+        return QueryTemplate(
+            name="Monthly Performance Analysis",
+            patterns=["monthly", "by month", "month over month", "mom", "monthly performance", "monthly trends", "month by month"],
+            sql=sql,
+            description="Monthly aggregation of key performance metrics"
+        )
+    
     def generate_top_campaigns(self) -> Optional[QueryTemplate]:
         """Generate top campaigns template."""
         campaign_col = self._resolve('campaign')
@@ -206,6 +241,7 @@ LIMIT 10
         impressions_col = self._resolve('impressions')
         clicks_col = self._resolve('clicks')
         conversions_col = self._resolve('conversions')
+        revenue_col = self._resolve('revenue') or self._resolve('conversion_value')
         
         if not all([channel_col, spend_col]):
             return None
@@ -220,7 +256,8 @@ SELECT
     SUM({conversions_col or '0'}) AS total_conversions,
     ROUND((SUM({clicks_col or '0'}) / NULLIF(SUM({impressions_col or '1'}), 0)) * 100, 2) AS ctr,
     ROUND(SUM({spend_col}) / NULLIF(SUM({clicks_col or '1'}), 0), 2) AS cpc,
-    ROUND(SUM({spend_col}) / NULLIF(SUM({conversions_col or '1'}), 0), 2) AS cpa
+    ROUND(SUM({spend_col}) / NULLIF(SUM({conversions_col or '1'}), 0), 2) AS cpa,
+    ROUND(SUM({revenue_col or '0'}) / NULLIF(SUM({spend_col}), 0), 2) AS roas
 FROM all_campaigns
 GROUP BY {channel_col}
 ORDER BY total_spend DESC
@@ -241,6 +278,7 @@ ORDER BY total_spend DESC
         impressions_col = self._resolve('impressions')
         clicks_col = self._resolve('clicks')
         conversions_col = self._resolve('conversions')
+        revenue_col = self._resolve('revenue') or self._resolve('conversion_value')
         
         if not all([platform_col, spend_col]):
             return None
@@ -255,10 +293,11 @@ SELECT
     SUM({conversions_col or '0'}) AS total_conversions,
     ROUND((SUM({clicks_col or '0'}) / NULLIF(SUM({impressions_col or '1'}), 0)) * 100, 2) AS ctr,
     ROUND(SUM({spend_col}) / NULLIF(SUM({clicks_col or '1'}), 0), 2) AS cpc,
-    ROUND(SUM({spend_col}) / NULLIF(SUM({conversions_col or '1'}), 0), 2) AS cpa
+    ROUND(SUM({spend_col}) / NULLIF(SUM({conversions_col or '1'}), 0), 2) AS cpa,
+    ROUND(SUM({revenue_col or '0'}) / NULLIF(SUM({spend_col}), 0), 2) AS roas
 FROM all_campaigns
 GROUP BY {platform_col}
-ORDER BY total_spend DESC
+ORDER BY roas DESC, total_spend DESC
         """  # nosec B608
         
         return QueryTemplate(
@@ -303,17 +342,63 @@ FROM all_campaigns
             description="High-level summary of all campaign performance"
         )
     
+    def generate_device_performance(self) -> Optional[QueryTemplate]:
+        """Generate device performance template for mobile vs desktop analysis."""
+        device_col = self._resolve('device') or self._resolve('device_type')
+        campaign_col = self._resolve('campaign')
+        spend_col = self._resolve('spend')
+        impressions_col = self._resolve('impressions')
+        clicks_col = self._resolve('clicks')
+        conversions_col = self._resolve('conversions')
+        
+        if not all([device_col, spend_col]):
+            logger.warning("Missing required columns for device performance analysis")
+            return None
+            
+        sql = f"""
+SELECT
+    {device_col} AS device_type,
+    COUNT(DISTINCT {campaign_col or '1'}) AS campaign_count,
+    SUM({spend_col}) AS total_spend,
+    SUM({impressions_col or '0'}) AS total_impressions,
+    SUM({clicks_col or '0'}) AS total_clicks,
+    SUM({conversions_col or '0'}) AS total_conversions,
+    ROUND((SUM({clicks_col or '0'}) / NULLIF(SUM({impressions_col or '1'}), 0)) * 100, 2) AS ctr,
+    ROUND(SUM({spend_col}) / NULLIF(SUM({clicks_col or '1'}), 0), 2) AS cpc,
+    ROUND(SUM({spend_col}) / NULLIF(SUM({conversions_col or '1'}), 0), 2) AS cpa,
+    ROUND((SUM({conversions_col or '0'}) / NULLIF(SUM({clicks_col or '1'}), 0)) * 100, 2) AS conversion_rate
+FROM all_campaigns
+WHERE {device_col} IS NOT NULL AND {device_col} != 'Unknown'
+GROUP BY {device_col}
+ORDER BY total_spend DESC
+        """  # nosec B608
+        
+        return QueryTemplate(
+            name="Device Performance Analysis",
+            patterns=[
+                "device performance", "mobile vs desktop", "mobile versus desktop", 
+                "device type", "mobile and desktop", "desktop and mobile", 
+                "mobile or desktop", "device comparison", "mobile desktop",
+                "compare device", "by device", "mobile performance", "desktop performance",
+                "is mobile", "is desktop", "how is mobile", "how is desktop"
+            ],
+            sql=sql,
+            description="Performance breakdown by device type (Mobile, Desktop, Tablet)"
+        )
+    
     def generate_all_templates(self) -> Dict[str, QueryTemplate]:
         """Generate all available templates based on schema."""
         templates = {}
         
         generators = [
             ("funnel_analysis", self.generate_funnel_analysis),
+            ("device_performance", self.generate_device_performance),  # Added for mobile vs desktop
             ("top_campaigns", self.generate_top_campaigns),
             ("channel_comparison", self.generate_channel_comparison),
             ("platform_comparison", self.generate_platform_comparison),
             ("roas_analysis", self.generate_roas_analysis),
             ("growth_analysis", self.generate_growth_analysis),
+            ("monthly_performance", self.generate_monthly_performance),
             ("summary", self.generate_summary),
         ]
         

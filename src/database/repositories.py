@@ -159,12 +159,31 @@ class CampaignRepository(BaseRepository):
         self.session.flush()
         return campaign
     
-    def create_bulk(self, data_list: List[Dict[str, Any]]) -> List[Campaign]:
-        """Bulk create campaigns."""
-        campaigns = [Campaign(**data) for data in data_list]
-        self.session.add_all(campaigns)
-        self.session.flush()
-        return campaigns
+    def create_bulk(self, data_list: List[Dict[str, Any]], batch_size: int = 50) -> List[Campaign]:
+        """
+        Bulk create campaigns with batching to avoid timeouts.
+        Returns all created campaigns.
+        """
+        all_campaigns = []
+        total = len(data_list)
+        
+        for i in range(0, total, batch_size):
+            batch_data = data_list[i:i + batch_size]
+            batch_campaigns = [Campaign(**data) for data in batch_data]
+            
+            try:
+                self.session.add_all(batch_campaigns)
+                self.session.commit()
+                # Refresh instances if needed, or just append to list (ids will be populated)
+                all_campaigns.extend(batch_campaigns)
+            except Exception as e:
+                self.session.rollback()
+                # Log error but try to continue or re-raise? 
+                # For bulk import, failing safely or re-raising is a choice. 
+                # Re-raising is safer to alert the user.
+                raise e
+                
+        return all_campaigns
     
     def get_by_campaign_id(self, campaign_id: str) -> Optional[Campaign]:
         """Get campaign by its unique ID string."""

@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: pca-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
+      # Uncomment when SSL is ready
+      # - ./nginx/certs:/etc/nginx/certs
+      # - ./nginx/ssl:/etc/ssl/private
+    depends_on:
+      - frontend
+      - api
+    restart: always
+    networks:
+      - default
+
+  # Frontend (Next.js)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Bake in the relative API URL for client-side calls through Nginx
+        NEXT_PUBLIC_API_URL: /api/v1
+    container_name: pca-frontend
+    environment:
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
+    restart: always
+    networks:
+      - default
+
+  # Explicitly list other services to ensure they join the same network
+  # and inherit prod settings if this file is run standalone (though it should be run with overrides)
+  api:
+    networks:
+      - default
+
+  celery-worker:
+    networks:
+      - default
+
+  celery-beat:
+    networks:
+      - default
+
+  # Observability Services
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: pca-jaeger
+    restart: always
+    ports:
+      - "16686:16686" # Web UI
+      - "6831:6831/udp" # Agent
+    environment:
+      - COLLECTOR_ZIPKIN_HOST_PORT=:9411
+    networks:
+      - default
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: pca-prometheus
+    restart: always
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    networks:
+      - default

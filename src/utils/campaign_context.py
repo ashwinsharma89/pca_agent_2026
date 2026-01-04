@@ -2,6 +2,7 @@
 Campaign Context Understanding Module.
 Extracts business goals, constraints, and priorities from campaign data.
 """
+import traceback
 from typing import Dict, List, Any
 from loguru import logger
 
@@ -24,33 +25,56 @@ class CampaignContextAnalyzer:
         Returns:
             Dictionary with goals, constraints, priorities, and insights
         """
+        try:
+            logger.info(f"Analyzing context with metrics keys: {list(metrics.keys())}")
+            
+            overview = metrics.get('overview', {})
+            logger.info(f"Overview type: {type(overview)}")
+            if not isinstance(overview, dict):
+                logger.error(f"Overview is not a dict! Value: {overview}")
+                # Fallback
+                overview = {}
+
+            platform_metrics = metrics.get('by_platform', {})
+            logger.info(f"Platform metrics type: {type(platform_metrics)}")
+
         
-        overview = metrics.get('overview', {})
-        platform_metrics = metrics.get('by_platform', {})
+            # Extract goals
+            goals = self._extract_goals(overview, platform_metrics)
+            
+            # Extract constraints
+            constraints = self._extract_constraints(overview, platform_metrics)
+            
+            # Extract priorities
+            priorities = self._extract_priorities(overview, platform_metrics)
+            
+            # Identify campaign stage
+            stage = self._identify_campaign_stage(overview)
+            
+            # Generate context summary
+            context_summary = self._generate_context_summary(goals, constraints, priorities, stage)
+            
+            return {
+                'goals': goals,
+                'constraints': constraints,
+                'priorities': priorities,
+                'stage': stage,
+                'summary': context_summary,
+                'recommendations_filter': self._build_recommendations_filter(goals, constraints)
+            }
         
-        # Extract goals
-        goals = self._extract_goals(overview, platform_metrics)
-        
-        # Extract constraints
-        constraints = self._extract_constraints(overview, platform_metrics)
-        
-        # Extract priorities
-        priorities = self._extract_priorities(overview, platform_metrics)
-        
-        # Identify campaign stage
-        stage = self._identify_campaign_stage(overview)
-        
-        # Generate context summary
-        context_summary = self._generate_context_summary(goals, constraints, priorities, stage)
-        
-        return {
-            'goals': goals,
-            'constraints': constraints,
-            'priorities': priorities,
-            'stage': stage,
-            'summary': context_summary,
-            'recommendations_filter': self._build_recommendations_filter(goals, constraints)
-        }
+        except Exception as e:
+            logger.error(f"Context analysis failed: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Return safe default
+            return {
+                'goals': [],
+                'constraints': {},
+                'priorities': [],
+                'stage': {'stage': 'unknown', 'description': 'Analysis failed'},
+                'summary': 'Context analysis failed',
+                'recommendations_filter': {}
+            }
     
     def _extract_goals(self, overview: Dict, platform_metrics: Dict) -> List[Dict[str, Any]]:
         """Infer campaign goals from performance data."""

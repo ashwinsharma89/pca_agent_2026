@@ -186,3 +186,59 @@ class TikTokAdsConnector(BaseAdConnector):
     
     def get_accounts(self) -> List[Dict[str, Any]]:
         return [TIKTOK_ACCOUNT] if self.use_mock else []
+
+    def get_ad_groups(self, campaign_id: str = None) -> List[Dict[str, Any]]:
+        """Get ad groups (mock only)."""
+        if not self.use_mock:
+            return []
+            
+        ad_groups = []
+        campaigns = [c for c in TIKTOK_CAMPAIGNS if not campaign_id or c["id"] == campaign_id]
+        
+        for camp in campaigns:
+            # Create 2 ad groups per campaign
+            for i in range(1, 3):
+                ad_groups.append({
+                    "id": f"{camp['id']}_ag_{i:03d}",
+                    "name": f"{camp['name']} - Ad Group {i}",
+                    "campaign_id": camp["id"],
+                    "status": camp["status"],
+                    "type": "STANDARD",
+                    "spend": camp["spend"] * 0.5,
+                })
+        return ad_groups
+
+    def get_ads(self, campaign_id: str = None, ad_group_id: str = None) -> List[Dict[str, Any]]:
+        """Get ads (mock only)."""
+        if not self.use_mock:
+            return []
+            
+        ads = []
+        ad_groups = self.get_ad_groups(campaign_id)
+        if ad_group_id:
+            ad_groups = [ag for ag in ad_groups if ag["id"] == ad_group_id]
+            
+        for ag in ad_groups:
+            # Create 3 ads per ad group
+            for i in range(1, 4):
+                spend = ag["spend"] / 3
+                impressions = int(spend * 1000 / 5.0)  # CPM ~ $5
+                clicks = int(impressions * 0.015)      # CTR ~ 1.5%
+                conversions = int(clicks * 0.05)       # CVR ~ 5%
+                
+                ads.append({
+                    "id": f"{ag['id']}_ad_{i:03d}",
+                    "name": f"{ag['name']} - Video Ad {i}",
+                    "ad_group_id": ag["id"],
+                    "campaign_id": ag["campaign_id"],
+                    "status": ag["status"],
+                    "type": "VIDEO",
+                    "spend": spend,
+                    "impressions": impressions,
+                    "clicks": clicks,
+                    "conversions": conversions,
+                    "ctr": 0.015,
+                    "cpc": spend / clicks if clicks > 0 else 0,
+                    "cpa": spend / conversions if conversions > 0 else 0,
+                })
+        return ads

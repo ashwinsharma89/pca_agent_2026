@@ -23,7 +23,9 @@ logger.info("=== SERVER STARTING ===")
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from loguru import logger
 
@@ -66,7 +68,9 @@ setup_exception_handlers(app)
 instrument_app(app)
 
 # Add rate limiter to app state
+# Add rate limiter to app state
 app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 
 # Custom rate limit exception handler
 @app.exception_handler(RateLimitExceeded)
@@ -124,6 +128,10 @@ app.add_middleware(
     expose_headers=["Content-Disposition", "Content-Type", "Content-Length"],  # Required for Chrome downloads
     max_age=3600,  # Cache preflight requests for 1 hour
 )
+
+# Add Request ID Middleware (Must be outermost to tag all logs)
+from .middleware.request_id import RequestIdMiddleware
+app.add_middleware(RequestIdMiddleware)
 
 # Include v1 router
 app.include_router(router_v1)

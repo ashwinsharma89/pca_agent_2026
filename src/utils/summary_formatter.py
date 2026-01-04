@@ -145,9 +145,12 @@ def _fix_section_headers(text: str) -> str:
         'Budget Optimization',
         'Optimization Roadmap',
         'Priority Actions',
+        'Overall',
         'Overall Summary',
         'Channel Summary',
+        'Key Strengths',
         'Key Strength',
+        'Priority Actions',
         'Priority Action'
     ]
     

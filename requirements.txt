@@ -47,6 +47,11 @@ pandas>=2.0.0
 numpy>=1.26.0
 python-dateutil>=2.8.2
 duckdb>=0.9.0
+polars>=1.0.0                     # Fast DataFrame library (Rust-based)
+pandera>=0.18.0                   # DataFrame schema validation
+sqlglot>=23.0.0                   # SQL parsing and AST validation
+pybreaker>=1.0.0                  # Circuit breaker pattern
+tenacity>=8.2.0                   # Retry with backoff
 openpyxl>=3.1.0
 scikit-learn
 

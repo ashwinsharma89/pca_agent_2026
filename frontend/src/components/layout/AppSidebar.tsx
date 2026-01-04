@@ -14,7 +14,8 @@ import {
     List,
     Activity,
     TrendingUp,
-    FileSpreadsheet
+    FileSpreadsheet,
+    Globe
 } from "lucide-react";
 
 type SidebarProps = React.HTMLAttributes<HTMLDivElement>;
@@ -82,6 +83,11 @@ export function AppSidebar({ className }: SidebarProps) {
             title: "Pacing Reports",
             href: "/pacing-reports",
             icon: FileSpreadsheet,
+        },
+        {
+            title: "API Connections",
+            href: "/ad-explorer",
+            icon: Globe,
         },
         {
             title: "Settings",

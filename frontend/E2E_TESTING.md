@@ -18,8 +18,6 @@ The primary test suite is located in `e2e/core-flows.spec.ts`. This suite covers
     - Dashboard
     - Upload
     - Intelligence Studio
-    - Anomaly Detective
-    - Real-Time Command
 3.  **Intelligence Studio:** Validates that the AI Chat interface accepts input and shows loading states.
 
 ## Running Tests

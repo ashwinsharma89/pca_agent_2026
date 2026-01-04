@@ -28,4 +28,7 @@ description: Project rules and conventions that must be followed
 
 ---
 
-*Last updated: 2025-12-23*
+*Last updated: 2026-01-02*
+
+4. **Safety First (Refactoring Rule)**: When making major changes to a major component, **always create a copy of the parent file first** (`filename.py.bak` or `_backup.py`). This allows for immediate rollback if the refactor fails.
+    - *Example*: Before refactoring `auto_insights.py`, run `cp auto_insights.py auto_insights_backup.py`.

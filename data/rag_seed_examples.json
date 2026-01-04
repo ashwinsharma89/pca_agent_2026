@@ -1,0 +1,174 @@
+{
+    "version": "1.0",
+    "description": "Seed SQL examples for hybrid RAG retrieval. Each example has rich metadata for structure matching.",
+    "examples": [
+        {
+            "id": 1,
+            "question": "Show daily CTR for last 30 days",
+            "sql": "WITH bounds AS (SELECT CAST(MAX(\"Date\") AS DATE) AS max_date FROM all_campaigns) SELECT CAST(\"Date\" AS DATE) AS date, SUM(Clicks) * 100.0 / NULLIF(SUM(Impressions), 0) AS ctr FROM all_campaigns, bounds WHERE CAST(\"Date\" AS DATE) >= max_date - INTERVAL '29 days' GROUP BY CAST(\"Date\" AS DATE) ORDER BY date",
+            "metadata": {
+                "intent": "trend_analysis",
+                "metric": "ctr",
+                "granularity": "daily",
+                "time_period": "last_30_days",
+                "calculates_growth": false,
+                "uses_window_function": false,
+                "group_by": [
+                    "Date"
+                ],
+                "sql_pattern": "time_series_simple"
+            }
+        },
+        {
+            "id": 2,
+            "question": "What's the weekly spend trend?",
+            "sql": "WITH bounds AS (SELECT CAST(MAX(\"Date\") AS DATE) AS max_date FROM all_campaigns) SELECT DATE_TRUNC('week', CAST(\"Date\" AS DATE)) AS week_start, SUM(\"Total Spent\") AS total_spend FROM all_campaigns, bounds WHERE CAST(\"Date\" AS DATE) >= max_date - INTERVAL '8 weeks' GROUP BY DATE_TRUNC('week', CAST(\"Date\" AS DATE)) ORDER BY week_start",
+            "metadata": {
+                "intent": "trend_analysis",
+                "metric": "spend",
+                "granularity": "weekly",
+                "time_period": "last_8_weeks",
+                "calculates_growth": false,
+                "uses_window_function": false,
+                "group_by": [
+                    "week_start"
+                ],
+                "sql_pattern": "time_series_simple"
+            }
+        },
+        {
+            "id": 3,
+            "question": "Show monthly performance breakdown",
+            "sql": "SELECT TO_CHAR(CAST(\"Date\" AS DATE), 'Mon-YY') AS month, SUM(\"Total Spent\") AS spend, SUM(\"Site Visit\") AS conversions, SUM(\"Total Spent\") / NULLIF(SUM(\"Site Visit\"), 0) AS cpa, SUM(Clicks) * 100.0 / NULLIF(SUM(Impressions), 0) AS ctr, SUM(Revenue_2024) / NULLIF(SUM(\"Total Spent\"), 0) AS roas FROM all_campaigns GROUP BY TO_CHAR(CAST(\"Date\" AS DATE), 'Mon-YY') ORDER BY MIN(CAST(\"Date\" AS DATE))",
+            "metadata": {
+                "intent": "breakdown",
+                "metric": "performance",
+                "granularity": "monthly",
+                "time_period": null,
+                "calculates_growth": false,
+                "uses_window_function": false,
+                "group_by": [
+                    "month"
+                ],
+                "sql_pattern": "aggregation_with_multiple_metrics"
+            }
+        },
+        {
+            "id": 4,
+            "question": "What's the ROAS by platform?",
+            "sql": "SELECT Platform, SUM(\"Total Spent\") AS total_spend, SUM(Revenue_2024) AS total_revenue, SUM(Revenue_2024) / NULLIF(SUM(\"Total Spent\"), 0) AS roas FROM all_campaigns GROUP BY Platform ORDER BY roas DESC",
+            "metadata": {
+                "intent": "breakdown",
+                "metric": "roas",
+                "granularity": null,
+                "time_period": null,
+                "calculates_growth": false,
+                "uses_window_function": false,
+                "group_by": [
+                    "Platform"
+                ],
+                "sql_pattern": "dimension_aggregation"
+            }
+        },
+        {
+            "id": 5,
+            "question": "Show top 10 campaigns by CPA",
+            "sql": "WITH bounds AS (SELECT CAST(MAX(\"Date\") AS DATE) AS max_date FROM all_campaigns) SELECT Campaign_Name_Full, SUM(\"Total Spent\") AS spend, SUM(\"Site Visit\") AS conversions, SUM(\"Total Spent\") / NULLIF(SUM(\"Site Visit\"), 0) AS cpa FROM all_campaigns, bounds WHERE CAST(\"Date\" AS DATE) >= max_date - INTERVAL '30 days' AND \"Site Visit\" > 0 GROUP BY Campaign_Name_Full HAVING SUM(\"Site Visit\") >= 5 ORDER BY cpa ASC LIMIT 10",
+            "metadata": {
+                "intent": "ranking",
+                "metric": "cpa",
+                "granularity": null,
+                "time_period": "last_30_days",
+                "calculates_growth": false,
+                "uses_window_function": false,
+                "group_by": [
+                    "Campaign_Name_Full"
+                ],
+                "order_direction": "ASC",
+                "limit": 10,
+                "sql_pattern": "ranking_query"
+            }
+        },
+        {
+            "id": 6,
+            "question": "Compare performance week over week",
+            "sql": "WITH bounds AS (SELECT CAST(MAX(\"Date\") AS DATE) AS max_date FROM all_campaigns), current_week AS (SELECT SUM(\"Total Spent\") AS spend, SUM(\"Site Visit\") AS conversions, SUM(Clicks) AS clicks FROM all_campaigns, bounds WHERE CAST(\"Date\" AS DATE) >= max_date - INTERVAL '6 days'), previous_week AS (SELECT SUM(\"Total Spent\") AS spend, SUM(\"Site Visit\") AS conversions, SUM(Clicks) AS clicks FROM all_campaigns, bounds WHERE CAST(\"Date\" AS DATE) >= max_date - INTERVAL '13 days' AND CAST(\"Date\" AS DATE) < max_date - INTERVAL '6 days') SELECT c.spend AS current_spend, p.spend AS previous_spend, ROUND((c.spend - p.spend) * 100.0 / NULLIF(p.spend, 0), 2) AS spend_change_pct, c.conversions AS current_conversions, p.conversions AS previous_conversions FROM current_week c, previous_week p",
+            "metadata": {
+                "intent": "comparison",
+                "metric": "performance",
+                "granularity": "weekly",
+                "time_period": "week_over_week",
+                "calculates_growth": true,
+                "uses_window_function": false,
+                "group_by": [],
+                "sql_pattern": "period_comparison"
+            }
+        },
+        {
+            "id": 7,
+            "question": "Show recently underperforming campaigns",
+            "sql": "WITH time_bounds AS (SELECT CAST(MAX(\"Date\") AS DATE) AS max_date, CAST(MAX(\"Date\") AS DATE) - INTERVAL '6 days' AS week_start, CAST(MAX(\"Date\") AS DATE) - INTERVAL '29 days' AS month_start FROM all_campaigns), recent_performance AS (SELECT Campaign_Name_Full, SUM(\"Total Spent\") / NULLIF(SUM(\"Site Visit\"), 0) AS recent_cpa, SUM(\"Site Visit\") AS recent_conversions FROM all_campaigns, time_bounds WHERE CAST(\"Date\" AS DATE) >= week_start GROUP BY Campaign_Name_Full), baseline_performance AS (SELECT Campaign_Name_Full, SUM(\"Total Spent\") / NULLIF(SUM(\"Site Visit\"), 0) AS baseline_cpa FROM all_campaigns, time_bounds WHERE CAST(\"Date\" AS DATE) >= month_start AND CAST(\"Date\" AS DATE) < week_start GROUP BY Campaign_Name_Full) SELECT r.Campaign_Name_Full, ROUND(r.recent_cpa, 2) AS recent_cpa, ROUND(b.baseline_cpa, 2) AS baseline_cpa, ROUND((r.recent_cpa - b.baseline_cpa) / NULLIF(b.baseline_cpa, 0) * 100, 2) AS cpa_increase_pct, CASE WHEN r.recent_cpa > b.baseline_cpa * 1.5 THEN 'Significantly worse' WHEN r.recent_cpa > b.baseline_cpa * 1.2 THEN 'Moderately worse' ELSE 'Slightly worse' END AS performance_status FROM recent_performance r JOIN baseline_performance b ON r.Campaign_Name_Full = b.Campaign_Name_Full WHERE r.recent_cpa > b.baseline_cpa AND r.recent_conversions >= 5 ORDER BY cpa_increase_pct DESC",
+            "metadata": {
+                "intent": "anomaly",
+                "metric": "cpa",
+                "granularity": null,
+                "time_period": "recent_vs_baseline",
+                "calculates_growth": true,
+                "uses_window_function": false,
+                "group_by": [
+                    "Campaign_Name_Full"
+                ],
+                "sql_pattern": "performance_comparison"
+            }
+        },
+        {
+            "id": 8,
+            "question": "What's the total spend by channel?",
+            "sql": "SELECT Channel, SUM(\"Total Spent\") AS total_spend, SUM(\"Site Visit\") AS conversions, SUM(Impressions) AS impressions, SUM(Clicks) AS clicks FROM all_campaigns GROUP BY Channel ORDER BY total_spend DESC",
+            "metadata": {
+                "intent": "breakdown",
+                "metric": "spend",
+                "granularity": null,
+                "time_period": null,
+                "calculates_growth": false,
+                "uses_window_function": false,
+                "group_by": [
+                    "Channel"
+                ],
+                "sql_pattern": "dimension_aggregation"
+            }
+        },
+        {
+            "id": 9,
+            "question": "Show device performance breakdown",
+            "sql": "SELECT \"Device Type\", SUM(\"Total Spent\") AS spend, SUM(\"Site Visit\") AS conversions, SUM(\"Total Spent\") / NULLIF(SUM(\"Site Visit\"), 0) AS cpa, SUM(Clicks) * 100.0 / NULLIF(SUM(Impressions), 0) AS ctr, SUM(Revenue_2024) / NULLIF(SUM(\"Total Spent\"), 0) AS roas FROM all_campaigns GROUP BY \"Device Type\" ORDER BY spend DESC",
+            "metadata": {
+                "intent": "breakdown",
+                "metric": "performance",
+                "granularity": null,
+                "time_period": null,
+                "calculates_growth": false,
+                "uses_window_function": false,
+                "group_by": [
+                    "Device Type"
+                ],
+                "sql_pattern": "dimension_aggregation"
+            }
+        },
+        {
+            "id": 10,
+            "question": "Calculate overall CPA for last week",
+            "sql": "WITH bounds AS (SELECT CAST(MAX(\"Date\") AS DATE) AS max_date FROM all_campaigns) SELECT SUM(\"Total Spent\") AS total_spend, SUM(\"Site Visit\") AS total_conversions, SUM(\"Total Spent\") / NULLIF(SUM(\"Site Visit\"), 0) AS cpa, CASE WHEN SUM(\"Site Visit\") < 100 THEN 'Low Confidence' ELSE 'High Confidence' END AS confidence FROM all_campaigns, bounds WHERE CAST(\"Date\" AS DATE) >= max_date - INTERVAL '6 days'",
+            "metadata": {
+                "intent": "aggregation",
+                "metric": "cpa",
+                "granularity": null,
+                "time_period": "last_7_days",
+                "calculates_growth": false,
+                "uses_window_function": false,
+                "group_by": [],
+                "sql_pattern": "simple_aggregation"
+            }
+        }
+    ]
+}

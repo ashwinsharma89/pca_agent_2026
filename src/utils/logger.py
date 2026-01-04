@@ -58,16 +58,22 @@ def setup_logger(name: str = None):
     - Centralized logging support
     """
     
-    # Remove default handler
     logger.remove()
     
-    # Console handler - always text for readability
-    logger.add(
-        sys.stdout,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        level="DEBUG" if settings.debug else "INFO",
-        colorize=True
-    )
+    # Console handler configuration
+    if LOG_FORMAT == "json":
+        logger.add(
+            sys.stdout,
+            serialize=True,
+            level="DEBUG" if settings.debug else "INFO",
+        )
+    else:
+        logger.add(
+            sys.stdout,
+            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+            level="DEBUG" if settings.debug else "INFO",
+            colorize=True
+        )
     
     # Create log directory
     log_dir = Path("logs")

@@ -1,4 +1,23 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+const getBaseUrl = () => {
+    if (typeof window !== 'undefined') {
+        // Client-side: Use configured public URL or localhost default
+        return process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+    }
+    // Server-side (SSR):
+    // 1. Prefer explicit internal URL if set
+    if (process.env.INTERNAL_API_URL) return process.env.INTERNAL_API_URL;
+
+    // 2. Intelligent Fallback:
+    // If public URL is relative (e.g. "/api/v1" behind Nginx), we MUST use the internal Docker service URL
+    if (process.env.NEXT_PUBLIC_API_URL?.startsWith('/')) {
+        return 'http://api:8000/api/v1';
+    }
+
+    // 3. Default for local dev
+    return process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+};
+
+const API_URL = getBaseUrl();
 
 type RequestMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
 

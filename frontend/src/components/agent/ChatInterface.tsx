@@ -53,7 +53,7 @@ export function ChatInterface({ campaignId }: ChatInterfaceProps) {
         setIsLoading(true);
 
         try {
-            const response = await api.chatWithCampaign(campaignId, userMessage.content);
+            const response: any = await api.chatWithCampaign(campaignId, userMessage.content);
 
             const botMessage: Message = {
                 id: (Date.now() + 1).toString(),

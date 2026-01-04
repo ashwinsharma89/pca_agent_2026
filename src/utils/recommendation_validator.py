@@ -110,7 +110,10 @@ class RecommendationValidator:
                     }
         
         # Check protected channels
-        protected = constraints.get('protected_channels', [])
+        if isinstance(constraints, dict):
+            protected = constraints.get('protected_channels', [])
+        else:
+            protected = []  # constraints is a list, not dict - skip complex lookup
         if protected:
             for channel_info in protected:
                 channel = channel_info['platform']
@@ -122,7 +125,10 @@ class RecommendationValidator:
                     }
         
         # Check performance thresholds
-        thresholds = constraints.get('performance_thresholds', {})
+        if isinstance(constraints, dict):
+            thresholds = constraints.get('performance_thresholds', {})
+        else:
+            thresholds = {}  # constraints is a list, skip threshold lookup
         if 'scale' in rec_lower or 'increase' in rec_lower:
             # Extract platform name
             platform_metrics = metrics.get('by_platform', {})

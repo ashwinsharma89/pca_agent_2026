@@ -234,10 +234,7 @@ PCA Agent is a **full-stack analytics platform** that helps marketing teams:
 | Page | Purpose |
 |------|---------|
 | 🏠 Dashboard | Quick overview |
-| 🔄 Comparison | Compare two time periods |
 | 📉 Regression | Statistical analysis |
-| 🚨 Anomaly Detective | Detect unusual patterns |
-| ⚡ Real-Time Command | Live monitoring |
 | ⚙️ Settings | API keys, preferences |
 
 ---
@@ -454,30 +451,49 @@ pca_agent/
 │   ├── src/
 │   │   ├── app/                 # Pages (upload, analysis, chat, etc.)
 │   │   ├── components/          # Reusable UI components
-│   │   ├── context/             # React contexts (auth, analysis)
 │   │   └── lib/                 # API client, utilities
-│   └── package.json
 │
 ├── 📂 src/                      # Python backend
 │   ├── api/                     # FastAPI endpoints
-│   │   ├── main.py              # Entry point
-│   │   └── v1/                  # API routes
+│   │   └── v1/                  # API routes (upload, campaigns, query)
+│   │
 │   ├── analytics/               # AI analysis logic
-│   │   └── auto_insights.py     # MediaAnalyticsExpert
-│   ├── query_engine/            # NL to SQL
-│   │   ├── nl_to_sql.py         # Query generation
-│   │   └── safe_query.py        # Security validation
-│   └── data_processing/         # Data standardization
+│   │   ├── auto_insights.py     # MediaAnalyticsExpert (Orchestrator)
+│   │   └── metrics_calculator.py# Fast polars-based metrics
+│   │
+│   ├── ingestion/               # Unified Ingestion Pipeline (Phase 2)
+│   │   ├── adapters.py          # Readers (CSV, Excel, API, DB)
+│   │   ├── normalizer.py        # Schema standardization
+│   │   ├── validators.py        # Data quality checks (Pandera)
+│   │   └── pipeline.py          # Pipeline orchestrator & Sink
+│   │
+│   ├── query_engine/            # NL to SQL Engine (Phase 2/3)
+│   │   ├── nl_to_sql.py         # Main Engine (Orchestrator)
+│   │   ├── schema_manager.py    # Schema extraction
+│   │   ├── prompt_builder.py    # RAG Prompt construction
+│   │   ├── executor.py          # Safe query execution
+│   │   └── validator.py         # AST Security checks
+│   │
+│   ├── intelligence/            # Advanced Intelligence (Phase 3)
+│   │   ├── lancedb_manager.py   # Hybrid Search (RAG)
+│   │   └── semantic_cache.py    # Semantic Caching
+│   │
+│   ├── database/                # Data Access Layer
+│   │   └── duckdb_repository.py # DuckDB operations
+│   │
+│   ├── services/                # Business Logic
+│   │   └── campaign_service.py  # Campaign operations
+│   │
+│   └── utils/                   # Shared Utilities
+│       ├── metrics.py           # Safe metric calculations
+│       └── column_mapping.py    # Column aliases
 │
 ├── 📂 data/                     # Database files
 │   └── campaigns.duckdb         # Your campaign data
 │
-├── 📂 knowledge_base/           # RAG documents
-│
-├── .env                         # API keys (OPENAI_API_KEY, etc.)
-├── requirements.txt             # Python dependencies
-├── start_all.sh                 # Start both servers
-└── stop_all.sh                  # Stop both servers
+├── 📂 tests/                    # Comprehensive Test Suite
+│   ├── unit/                    # Unit tests
+│   └── integration/             # End-to-end tests
 ```
 
 ---

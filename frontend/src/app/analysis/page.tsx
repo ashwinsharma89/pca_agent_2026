@@ -9,7 +9,7 @@ import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { Loader2, TrendingUp, DollarSign, MousePointerClick, Eye, Target, Zap, ChevronDown, BarChart3, TrendingDown } from "lucide-react";
+import { Loader2, TrendingUp, DollarSign, MousePointerClick, Eye, Target, Zap, ChevronDown, BarChart3, TrendingDown, Activity, Stethoscope, CheckCircle, AlertTriangle } from "lucide-react";
 import { api } from "@/lib/api";
 
 interface AggregatedMetrics {
@@ -42,10 +42,26 @@ export default function GlobalAnalysisPage() {
     } = useAnalysis();
 
     const [metrics, setMetrics] = useState<AggregatedMetrics | null>(null);
+    const [healthCheckLoading, setHealthCheckLoading] = useState(false);
+    const [healthCheckResult, setHealthCheckResult] = useState<any>(null);
 
     useEffect(() => {
         loadMetrics();
     }, []);
+
+    const runHealthCheck = async () => {
+        setHealthCheckLoading(true);
+        setHealthCheckResult(null);
+        try {
+            const result = await api.post('/analyze/health-check', {});
+            setHealthCheckResult(result);
+        } catch (error) {
+            console.error("Health check failed", error);
+            setHealthCheckResult({ success: false, error: String(error) });
+        } finally {
+            setHealthCheckLoading(false);
+        }
+    };
 
     const loadMetrics = async () => {
         try {
@@ -86,6 +102,9 @@ export default function GlobalAnalysisPage() {
         // Split into paragraphs/sections
         const mainSections = [
             "Performance Overview",
+            "Performance vs Industry Benchmarks",
+            "Multi-KPI Analysis",
+            "Platform-Specific Insights",
             "Channel & Platform Analysis",
             "Funnel & Strategic Insights",
             "Ad Type & Creative Performance",
@@ -93,7 +112,19 @@ export default function GlobalAnalysisPage() {
             "What Is Working",
             "What Is Not Working",
             "Budget Optimization",
-            "Priority Actions"
+            "Optimization Roadmap",
+            "Priority Actions",
+            "Overall",
+            "Overall Summary",
+            "Channel Summary",
+            "Key Strengths",
+            "Key Strength",
+            "The \"So What?\" Test",
+            "Outcomes Over Activity",
+            "Quantify Impact",
+            "Root Cause Analysis",
+            "Prescriptive Actions",
+            "Strategic Recommendations"
         ];
 
         const sections = text.split(/\n\n+/);
@@ -271,24 +302,44 @@ export default function GlobalAnalysisPage() {
                         </div>
                     </div>
 
-                    <Button
-                        onClick={runAutoAnalysis}
-                        disabled={analyzing}
-                        className="w-full bg-violet-600 hover:bg-violet-700 text-white font-bold h-12 rounded-xl transition-all hover:scale-[1.01] active:scale-[0.99] shadow-lg shadow-violet-600/20"
-                    >
-                        {analyzing ? (
-                            <>
-                                <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                                RAG Summary...
-                            </>
-                        ) : (
-                            <>
-                                <Zap className="mr-2 h-5 w-5" />
-                                RAG Summary
-                            </>
-                        )}
-                    </Button>
+                    <div className="flex gap-4">
+                        <Button
+                            onClick={runAutoAnalysis}
+                            disabled={analyzing}
+                            className="flex-1 bg-violet-600 hover:bg-violet-700 text-white font-bold h-12 rounded-xl transition-all hover:scale-[1.01] active:scale-[0.99] shadow-lg shadow-violet-600/20"
+                        >
+                            {analyzing ? (
+                                <>
+                                    <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                                    RAG Summary...
+                                </>
+                            ) : (
+                                <>
+                                    <Zap className="mr-2 h-5 w-5" />
+                                    RAG Summary
+                                </>
+                            )}
+                        </Button>
+                        <Button
+                            onClick={runHealthCheck}
+                            disabled={healthCheckLoading}
+                            className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold h-12 rounded-xl transition-all hover:scale-[1.01] active:scale-[0.99] shadow-lg shadow-emerald-600/20"
+                        >
+                            {healthCheckLoading ? (
+                                <>
+                                    <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                                    Running Health Check...
+                                </>
+                            ) : (
+                                <>
+                                    <Stethoscope className="mr-2 h-5 w-5" />
+                                    Campaign Health Check
+                                </>
+                            )}
+                        </Button>
+                    </div>
                 </CardContent>
+
             </Card>
 
             {/* Key Metrics Overview */}
@@ -301,12 +352,12 @@ export default function GlobalAnalysisPage() {
                     {[
                         { title: "Portfolio Spend", val: formatCurrency(metrics?.total_spend || 0), icon: DollarSign },
                         { title: "Conversions", val: formatNumber(metrics?.total_conversions || 0), icon: Target },
-                        { title: "Avg. Efficiency (CTR)", val: `${metrics?.avg_ctr.toFixed(2)}%`, icon: TrendingUp },
+                        { title: "Avg. Efficiency (CTR)", val: `${(metrics?.avg_ctr || 0).toFixed(2)}%`, icon: TrendingUp },
                         { title: "Portfolio CPA", val: formatCurrency(metrics?.avg_cpa || 0), icon: DollarSign },
                         { title: "Portfolio Clicks", val: formatNumber(metrics?.total_clicks || 0), icon: MousePointerClick },
                         { title: "Gross Impressions", val: formatNumber(metrics?.total_impressions || 0), icon: Eye },
                         { title: "Portfolio CPC", val: formatCurrency(metrics?.avg_cpc || 0), icon: DollarSign },
-                        { title: "Conv. Rate", val: `${metrics?.conversion_rate.toFixed(2)}%`, icon: TrendingUp },
+                        { title: "Conv. Rate", val: `${(metrics?.conversion_rate || 0).toFixed(2)}%`, icon: TrendingUp },
                     ].map((item, i) => (
                         <Card key={i} className="hover:border-violet-500/30 transition-colors bg-card shadow-sm border-border/60">
                             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
@@ -320,6 +371,92 @@ export default function GlobalAnalysisPage() {
                     ))}
                 </div>
             </div>
+
+            {/* Health Check Results */}
+            {healthCheckResult && (
+                <Card className={`border-2 ${healthCheckResult.success ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-red-500/30 bg-red-500/5'}`}>
+                    <CardHeader>
+                        <div className="flex items-center gap-3">
+                            <div className={`rounded-lg p-2 ${healthCheckResult.success ? 'bg-emerald-500' : 'bg-red-500'}`}>
+                                {healthCheckResult.success ? (
+                                    <CheckCircle className="h-5 w-5 text-white" />
+                                ) : (
+                                    <AlertTriangle className="h-5 w-5 text-white" />
+                                )}
+                            </div>
+                            <div>
+                                <CardTitle className="text-xl">Campaign Health Check Results</CardTitle>
+                                <CardDescription>
+                                    {healthCheckResult.success
+                                        ? `Completed in ${healthCheckResult.duration_seconds?.toFixed(2) || 0}s - ${healthCheckResult.steps?.length || 0} agents ran`
+                                        : 'Health check encountered errors'}
+                                </CardDescription>
+                            </div>
+                        </div>
+                    </CardHeader>
+                    <CardContent className="space-y-6">
+                        {/* Steps Status */}
+                        <div className="flex flex-wrap gap-2">
+                            {healthCheckResult.steps?.map((step: any, i: number) => (
+                                <Badge
+                                    key={i}
+                                    variant={step.status === 'success' ? 'default' : step.status === 'skipped' ? 'secondary' : 'destructive'}
+                                    className={step.status === 'success' ? 'bg-emerald-500' : ''}
+                                >
+                                    {step.step}: {step.status}
+                                </Badge>
+                            ))}
+                        </div>
+
+                        {/* Metrics */}
+                        {healthCheckResult.metrics?.answer && (
+                            <div className="space-y-2">
+                                <h4 className="font-semibold text-sm uppercase tracking-wider text-muted-foreground">Metrics Analysis</h4>
+                                <p className="text-sm leading-relaxed">{healthCheckResult.metrics.answer}</p>
+                            </div>
+                        )}
+
+                        {/* Insights */}
+                        {healthCheckResult.insights?.executive_summary && (
+                            <div className="space-y-2">
+                                <h4 className="font-semibold text-sm uppercase tracking-wider text-muted-foreground">AI Insights</h4>
+                                <div className="text-sm leading-relaxed">
+                                    {typeof healthCheckResult.insights.executive_summary === 'string'
+                                        ? healthCheckResult.insights.executive_summary
+                                        : (healthCheckResult.insights.executive_summary.brief || '')}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Recommendations */}
+                        {healthCheckResult.all_recommendations?.length > 0 && (
+                            <div className="space-y-2">
+                                <h4 className="font-semibold text-sm uppercase tracking-wider text-muted-foreground">Recommendations</h4>
+                                <ul className="space-y-1">
+                                    {healthCheckResult.all_recommendations.slice(0, 5).map((rec: string, i: number) => (
+                                        <li key={i} className="text-sm flex items-start gap-2">
+                                            <span className="text-emerald-500 mt-1">→</span>
+                                            {typeof rec === 'string' ? rec : JSON.stringify(rec)}
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+
+                        {/* Errors */}
+                        {healthCheckResult.errors?.length > 0 && (
+                            <div className="space-y-2">
+                                <h4 className="font-semibold text-sm uppercase tracking-wider text-red-500">Errors</h4>
+                                <ul className="space-y-1">
+                                    {healthCheckResult.errors.map((err: string, i: number) => (
+                                        <li key={i} className="text-sm text-red-500">{err}</li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+            )}
 
             {/* Analysis Results */}
             {!analysisResult && !analyzing && (
@@ -355,7 +492,6 @@ export default function GlobalAnalysisPage() {
                                                 RAG SYNCED
                                             </Badge>
                                         )}
-                                        <Badge variant="secondary" className="px-3">Q4 2024</Badge>
                                     </div>
                                 </div>
                             </CardHeader>
@@ -364,11 +500,16 @@ export default function GlobalAnalysisPage() {
                                 <div className="bg-muted/30 p-6 rounded-2xl border border-border/50 shadow-inner">
                                     <h4 className="text-xs font-bold text-violet-500 uppercase tracking-widest mb-4">Core Brief</h4>
                                     <div className="text-base font-medium leading-relaxed">
-                                        {typeof (analysisResult.executive_summary.brief || analysisResult.executive_summary) === 'string'
-                                            ? renderMarkdown(analysisResult.executive_summary.brief || analysisResult.executive_summary)
-                                            : analysisResult.executive_summary.brief || analysisResult.executive_summary}
+                                        {(() => {
+                                            const summary = analysisResult.executive_summary;
+                                            const text = typeof summary === 'string'
+                                                ? summary
+                                                : (summary?.brief || '');
+                                            return typeof text === 'string' ? renderMarkdown(text) : null;
+                                        })()}
                                     </div>
                                 </div>
+
 
                                 {/* Detailed Summary (Accordion Style for Parity) */}
                                 {analysisResult.executive_summary.detailed && (
@@ -473,59 +614,7 @@ export default function GlobalAnalysisPage() {
                         )}
                     </div>
 
-                    {/* Platform Deep Dive (Platform Breakdown) */}
-                    {analysisResult.metrics?.by_platform && (
-                        <Card className="border-border/60 shadow-xl shadow-black/5">
-                            <CardHeader>
-                                <div className="flex items-center gap-3">
-                                    <div className="bg-indigo-500/10 rounded-lg p-2">
-                                        <MousePointerClick className="h-5 w-5 text-indigo-500" />
-                                    </div>
-                                    <CardTitle>Cross-Channel Efficiency Metrics</CardTitle>
-                                </div>
-                            </CardHeader>
-                            <CardContent>
-                                <Accordion type="multiple" className="w-full space-y-3">
-                                    {Object.entries(analysisResult.metrics.by_platform).map(([platform, data]: [string, any]) => (
-                                        <AccordionItem
-                                            key={platform}
-                                            value={platform}
-                                            className="border rounded-xl px-4 bg-muted/20 data-[state=open]:bg-card transition-colors border-border/40"
-                                        >
-                                            <AccordionTrigger className="hover:no-underline py-4 font-bold text-lg">
-                                                <div className="flex items-center gap-3">
-                                                    <span className="w-8 h-8 rounded bg-background flex items-center justify-center text-xs font-bold border">
-                                                        {platform[0]}
-                                                    </span>
-                                                    {platform}
-                                                </div>
-                                            </AccordionTrigger>
-                                            <AccordionContent className="pb-6">
-                                                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 px-2">
-                                                    <div className="bg-background rounded-lg p-3 border border-border/50">
-                                                        <p className="text-[10px] font-bold text-muted-foreground uppercase mb-1">Total CapEx</p>
-                                                        <p className="text-xl font-bold">{formatCurrency(data.Spend || 0)}</p>
-                                                    </div>
-                                                    <div className="bg-background rounded-lg p-3 border border-border/50">
-                                                        <p className="text-[10px] font-bold text-muted-foreground uppercase mb-1">Acquisitions</p>
-                                                        <p className="text-xl font-bold">{formatNumber(data.Conversions || 0)}</p>
-                                                    </div>
-                                                    <div className="bg-background rounded-lg p-3 border border-border/50">
-                                                        <p className="text-[10px] font-bold text-muted-foreground uppercase mb-1">Efficiency (CTR)</p>
-                                                        <p className="text-xl font-bold">{(data.CTR || 0).toFixed(2)}%</p>
-                                                    </div>
-                                                    <div className="bg-background rounded-lg p-3 border border-border/50">
-                                                        <p className="text-[10px] font-bold text-muted-foreground uppercase mb-1">Avg. CPA</p>
-                                                        <p className="text-xl font-bold">{formatCurrency(data.CPA || 0)}</p>
-                                                    </div>
-                                                </div>
-                                            </AccordionContent>
-                                        </AccordionItem>
-                                    ))}
-                                </Accordion>
-                            </CardContent>
-                        </Card>
-                    )}
+
 
                     {/* Industrial Benchmarking */}
                     {config.include_benchmarks && analysisResult.benchmarks && (

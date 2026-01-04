@@ -145,6 +145,11 @@ def get_user_service(db: Session = Depends(get_db)):
     return container.services.user_service(session=db)
 
 
+def get_campaign_service():
+    """Get campaign service."""
+    return container.services.campaign_service()
+
+
 # ============================================================================
 # Event Bus Dependencies
 # ============================================================================

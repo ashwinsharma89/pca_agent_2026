@@ -15,7 +15,11 @@ import time
 
 # Data directory for parquet files
 DATA_DIR = Path("data")
-CAMPAIGNS_PARQUET = DATA_DIR / "campaigns.parquet"
+# Data directory for parquet files
+DATA_DIR = Path("data")
+CAMPAIGNS_DIR = DATA_DIR / "campaigns"
+CAMPAIGNS_PATTERN = str(CAMPAIGNS_DIR / "**" / "*.parquet")
+CAMPAIGNS_PARQUET = DATA_DIR / "campaigns.parquet"  # Legacy single-file path for backwards compatibility
 DUCKDB_FILE = DATA_DIR / "analytics.duckdb"  # Persistent DuckDB database
 
 
@@ -58,10 +62,11 @@ class DuckDBManager:
         try:
             start = time.time()
             with self.connection() as conn:
-                # Create or replace campaigns table from Parquet
+                # Create or replace campaigns table from Parquet Glob
+                # Hive partitioning is automatic with read_parquet or glob
                 conn.execute(f"""
                     CREATE OR REPLACE TABLE campaigns AS 
-                    SELECT * FROM '{CAMPAIGNS_PARQUET}'
+                    SELECT * FROM read_parquet('{CAMPAIGNS_PATTERN}', hive_partitioning=true)
                 """)
                 
                 # Get column names for index creation
@@ -137,7 +142,7 @@ class DuckDBManager:
         if self._indexed:
             return "campaigns"
         else:
-            return f"'{CAMPAIGNS_PARQUET}'"
+            return f"read_parquet('{CAMPAIGNS_PATTERN}', hive_partitioning=true)"
     
     @contextmanager
     def connection(self):
@@ -150,26 +155,42 @@ class DuckDBManager:
     
     def has_data(self) -> bool:
         """Check if campaign data exists."""
-        return CAMPAIGNS_PARQUET.exists()
+        # Check if directory exists and has at least one parquet file
+        return CAMPAIGNS_DIR.exists() and any(CAMPAIGNS_DIR.glob("**/*.parquet"))
     
     def save_campaigns(self, df: pd.DataFrame) -> int:
         """
-        Save campaigns DataFrame to Parquet.
+        Save campaigns DataFrame to Partitioned Parquet (Hive Style).
+        Structure: data/campaigns/year=YYYY/month=MM/campaigns-uuid.parquet
         Returns number of rows saved.
-        Automatically rebuilds performance indexes.
         """
         try:
-            # Ensure data directory exists
-            self.data_dir.mkdir(exist_ok=True)
+            # Ensure base directory exists
+            campaigns_dir = self.data_dir / "campaigns"
+            campaigns_dir.mkdir(parents=True, exist_ok=True)
             
-            # Save as Parquet (columnar, compressed)
-            df.to_parquet(CAMPAIGNS_PARQUET, index=False, compression='snappy')
+            # Parse Date column
+            if 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+                # Add partition columns
+                df['year'] = df['Date'].dt.year
+                df['month'] = df['Date'].dt.month
+            
+            # Save as Partitioned Parquet
+            # compression='snappy' is default and good balance
+            df.to_parquet(
+                campaigns_dir,
+                index=False,
+                compression='snappy',
+                partition_cols=['year', 'month'],
+                existing_data_behavior='overwrite_or_ignore'
+            )
             
             # Invalidate and rebuild indexes
             self._indexed = False
             self.ensure_indexes()
             
-            logger.info(f"Saved {len(df)} campaigns to {CAMPAIGNS_PARQUET} (indexes rebuilt)")
+            logger.info(f"Saved {len(df)} campaigns to {campaigns_dir} (partitioned)")
             return len(df)
             
         except Exception as e:
@@ -178,16 +199,11 @@ class DuckDBManager:
     
     def append_campaigns(self, df: pd.DataFrame) -> int:
         """
-        Append campaigns to existing Parquet file.
-        Returns total number of rows.
+        Append campaigns to partitioned dataset.
+        For partitioned parquet, 'append' is just 'write new files'.
         """
         try:
-            if self.has_data():
-                existing_df = pd.read_parquet(CAMPAIGNS_PARQUET)
-                df = pd.concat([existing_df, df], ignore_index=True)
-            
             return self.save_campaigns(df)
-            
         except Exception as e:
             logger.error(f"Failed to append campaigns: {e}")
             raise
@@ -231,7 +247,7 @@ class DuckDBManager:
                 
                 query = f"""
                     SELECT * 
-                    FROM '{CAMPAIGNS_PARQUET}'
+                    FROM {self.get_optimized_table()}
                     WHERE {where_sql}
                     LIMIT {limit}
                 """
@@ -254,7 +270,9 @@ class DuckDBManager:
         try:
             with self.connection() as conn:
                 # Get column names
-                columns_query = f"DESCRIBE SELECT * FROM '{CAMPAIGNS_PARQUET}'"
+                # Use read_parquet directly for describe if table not ready
+                table_ref = self.get_optimized_table()
+                columns_query = f"DESCRIBE SELECT * FROM {table_ref}"
                 columns_df = conn.execute(columns_query).df()
                 all_columns = columns_df['column_name'].tolist()
                 
@@ -276,7 +294,7 @@ class DuckDBManager:
                     try:
                         query = f"""
                             SELECT DISTINCT CAST("{col}" AS VARCHAR) as val
-                            FROM '{CAMPAIGNS_PARQUET}'
+                            FROM {self.get_optimized_table()}
                             WHERE "{col}" IS NOT NULL 
                             AND CAST("{col}" AS VARCHAR) != 'Unknown'
                             AND CAST("{col}" AS VARCHAR) != ''
@@ -333,11 +351,11 @@ class DuckDBManager:
                 query = f"""
                     SELECT 
                         "{group_by}" as name,
-                        SUM(COALESCE("Spend", "Total Spent", 0)) as spend,
-                        SUM(COALESCE("Impressions", "Impr", 0)) as impressions,
+                        SUM(COALESCE("Spend", 0)) as spend,
+                        SUM(COALESCE("Impressions", 0)) as impressions,
                         SUM(COALESCE("Clicks", 0)) as clicks,
-                        SUM(COALESCE("Conversions", "Site Visit", 0)) as conversions
-                    FROM '{CAMPAIGNS_PARQUET}'
+                        SUM(COALESCE("Conversions", 0)) as conversions
+                    FROM {self.get_optimized_table()}
                     WHERE {where_sql}
                     AND "{group_by}" IS NOT NULL
                     GROUP BY "{group_by}"
@@ -392,11 +410,11 @@ class DuckDBManager:
                 query = f"""
                     SELECT 
                         "{date_column}" as date,
-                        SUM(COALESCE("Spend", "Total Spent", 0)) as spend,
-                        SUM(COALESCE("Impressions", "Impr", 0)) as impressions,
+                        SUM(COALESCE("Spend", 0)) as spend,
+                        SUM(COALESCE("Impressions", 0)) as impressions,
                         SUM(COALESCE("Clicks", 0)) as clicks,
-                        SUM(COALESCE("Conversions", "Site Visit", 0)) as conversions
-                    FROM '{CAMPAIGNS_PARQUET}'
+                        SUM(COALESCE("Conversions", 0)) as conversions
+                    FROM {self.get_optimized_table()}
                     WHERE {where_sql}
                     AND "{date_column}" IS NOT NULL
                     GROUP BY "{date_column}"
@@ -448,12 +466,12 @@ class DuckDBManager:
                 
                 query = f"""
                     SELECT 
-                        SUM(COALESCE("Spend", "Total Spent", 0)) as total_spend,
-                        SUM(COALESCE("Impressions", "Impr", 0)) as total_impressions,
+                        SUM(COALESCE("Spend", 0)) as total_spend,
+                        SUM(COALESCE("Impressions", 0)) as total_impressions,
                         SUM(COALESCE("Clicks", 0)) as total_clicks,
-                        SUM(COALESCE("Conversions", "Site Visit", 0)) as total_conversions,
+                        SUM(COALESCE("Conversions", 0)) as total_conversions,
                         COUNT(*) as campaign_count
-                    FROM '{CAMPAIGNS_PARQUET}'
+                    FROM {self.get_optimized_table()}
                     WHERE {where_sql}
                 """
                 
@@ -489,7 +507,7 @@ class DuckDBManager:
         
         try:
             with self.connection() as conn:
-                result = conn.execute(f"SELECT COUNT(*) FROM '{CAMPAIGNS_PARQUET}'").fetchone()  # nosec B608
+                result = conn.execute(f"SELECT COUNT(*) FROM {self.get_optimized_table()}").fetchone()
                 return result[0] if result else 0
         except Exception as e:
             logger.error(f"Failed to get count: {e}")
@@ -497,8 +515,9 @@ class DuckDBManager:
     
     def clear_data(self):
         """Delete all campaign data."""
-        if CAMPAIGNS_PARQUET.exists():
-            CAMPAIGNS_PARQUET.unlink()
+        if CAMPAIGNS_DIR.exists():
+            import shutil
+            shutil.rmtree(CAMPAIGNS_DIR)
             logger.info("Cleared campaign data")
 
 
