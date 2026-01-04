@@ -37,7 +37,7 @@ hiredis>=2.2.0  # C parser for better performance
 
 
 # Computer Vision
-opencv-python-headless==4.10.0.84
+opencv-python-headless==4.12.0.88
 Pillow>=10.2.0  # Security fixes
 pytesseract==0.3.10
 pdf2image==1.17.0
